@@ -5,13 +5,16 @@ import torch
 from torchvision import transforms, datasets
 import torchvision.models as models
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import matplotlib.pyplot as plt
-import cv2
-
 # import pandas as pd
+
+
+from torch_lr_finder import LRFinder
+# from onecyclelr.onecyclelr import OneCycleLR
+from One_Cycle_Policy import OneCycle
+
 device = "cuda"
 
 train_images = np.load("./train_images_invert_0203.npy")
@@ -22,17 +25,44 @@ train_labels = np.load("./train_labels_shuffle_0202.npy")
 
 IMAGE_SIZE = (224,224)
 MODEL_TYPE = "50"
-
 USE_CUTMIX = True
 CUT_MIX_RATE = 1
-USE_MIXUP = False
-MIXUP_RATE = 0
-GRIDMASK_RATE = 0.3
-
-OHEM_RATE = 0  #only use top 70% loss to do backpropagation
-
 NO_EXTRA_AUG = True
 USE_PRETRAINED = True
+
+import torch.nn as nn
+import torch.nn.functional as F
+from efficientnet_pytorch import EfficientNet
+# model = EfficientNet.from_pretrained('efficientnet-b3')
+
+# out_channels = 1280  #eff-b0
+# out_channels = 1536  #eff-b3
+# out_channels = 2560  #eff-b7
+
+class EffNet(nn.Module):
+    def __init__(self,in_channels=3):
+        super().__init__()
+        self.backbone = EfficientNet.from_pretrained('efficientnet-b7',in_channels=in_channels)
+        self._avg_pooling = nn.AdaptiveAvgPool2d(1)
+        self._dropout = nn.Dropout(0.2)
+        self._fc_root = nn.Linear(out_channels, 168)
+        self._fc_vowel = nn.Linear(out_channels, 11)
+        self._fc_constant = nn.Linear(out_channels, 7)
+    def forward(self, inputs):
+        bs = inputs.size(0)
+        # Convolution layers
+        x = self.backbone.extract_features(inputs)
+#         print("feature size:", x.size())
+        # Pooling and final linear layer
+        x = self._avg_pooling(x)
+        x = x.view(bs, -1)
+        x = self._dropout(x)
+        out_root = self._fc_root(x)
+        out_vowel = self._fc_vowel(x)
+        out_constant = self._fc_constant(x)
+        return out_root, out_vowel, out_constant
+        
+        
 
 from se_resnet import *
 from collections import OrderedDict
@@ -59,30 +89,6 @@ def get_resnext_model(model_type="101", pretrained=True):
     model.classifier_constant = nn.Linear(model.feature_dim, 7)
     return model
 
-
-
-def ohem_loss(cls_pred, cls_target):
-    batch_size = cls_pred.size(0) 
-    ohem_cls_loss = F.cross_entropy(cls_pred, cls_target, reduction='none', ignore_index=-1)
-
-    # print("shape here:",ohem_cls_loss.size())  ###([batch])
-
-    keep_num = min(ohem_cls_loss.size()[0], int(batch_size*OHEM_RATE) )
-
-    ###Topk way : torch.topk(input, k, dim=None, largest=True, sorted=True, out=None)
-    # ohem_cls_loss, k_indices = torch.topk(ohem_cls_loss, keep_num, largest=False)
-    ohem_cls_loss, k_indices = torch.topk(ohem_cls_loss, keep_num, largest=True)
-    # print("shape here:",ohem_cls_loss.size())  ###([keep_num])
-
-    ###Origin way
-    # if keep_num < sorted_ohem_loss.size()[0]:
-    #     sorted_ohem_loss, idx = torch.sort(ohem_cls_loss, descending=True)
-    #     keep_idx_cuda = idx[:keep_num]
-    #     ohem_cls_loss = ohem_cls_loss[keep_idx_cuda]
-
-    # print("shape:",ohem_cls_loss.size())  ###([keep_num])
-    cls_loss = ohem_cls_loss.sum() / keep_num
-    return cls_loss
 
 def rand_bbox(size, lam):
     W = size[2]
@@ -120,11 +126,7 @@ def cutmix(data, targets1, targets2, targets3, alpha):
 def cutmix_criterion(preds1,preds2,preds3, targets):
     targets1, targets2,targets3, targets4,targets5, targets6, lam = \
     targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
-
-    if OHEM_RATE > 0:
-        criterion2 = ohem_loss
-    else:
-        criterion2 = nn.CrossEntropyLoss(reduction='mean')
+    criterion2 = nn.CrossEntropyLoss(reduction='mean')
     
 #     print("here", preds1.size(), np.shape(targets1))
     return lam * criterion2(preds1, targets1) + (1 - lam) * \
@@ -147,95 +149,15 @@ def mixup(data, targets1, targets2, targets3, alpha):
 
 
 def mixup_criterion(preds1,preds2,preds3, targets):
-    targets1, targets2,targets3, targets4,targets5, targets6, lam = \
-    targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
-
-    if OHEM_RATE > 0:
-        criterion2 = ohem_loss
-    else:
-        criterion2 = nn.CrossEntropyLoss(reduction='mean')
-
-    return lam * criterion2(preds1, targets1) + (1 - lam) * criterion2(preds1, targets2) + \
-    lam * criterion2(preds2, targets3) + (1 - lam) * criterion2(preds2, targets4) + \
-    lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
-
-import albumentations
-from albumentations.core.transforms_interface import DualTransform
-from albumentations.augmentations import functional as F
-class GridMask(DualTransform):
-    def __init__(self, num_grid=3, fill_value=0, rotate=0, mode=0, always_apply=False, p=0.5):
-        super(GridMask, self).__init__(always_apply, p)
-        if isinstance(num_grid, int):
-            num_grid = (num_grid, num_grid)
-        if isinstance(rotate, int):
-            rotate = (-rotate, rotate)
-        self.num_grid = num_grid
-        self.fill_value = fill_value
-        self.rotate = rotate
-        self.mode = mode
-        self.masks = None
-        self.rand_h_max = []
-        self.rand_w_max = []
-
-    def init_masks(self, height, width):
-        if self.masks is None:
-            self.masks = []
-            n_masks = self.num_grid[1] - self.num_grid[0] + 1
-            for n, n_g in enumerate(range(self.num_grid[0], self.num_grid[1] + 1, 1)):
-                grid_h = height / n_g
-                grid_w = width / n_g
-                this_mask = np.ones((int((n_g + 1) * grid_h), int((n_g + 1) * grid_w))).astype(np.uint8)
-                for i in range(n_g + 1):
-                    for j in range(n_g + 1):
-                        this_mask[
-                             int(i * grid_h) : int(i * grid_h + grid_h / 2),
-                             int(j * grid_w) : int(j * grid_w + grid_w / 2)
-                        ] = self.fill_value
-                        if self.mode == 2:
-                            this_mask[
-                                 int(i * grid_h + grid_h / 2) : int(i * grid_h + grid_h),
-                                 int(j * grid_w + grid_w / 2) : int(j * grid_w + grid_w)
-                            ] = self.fill_value
-                
-                if self.mode == 1:
-                    this_mask = 1 - this_mask
-
-                self.masks.append(this_mask)
-                self.rand_h_max.append(grid_h)
-                self.rand_w_max.append(grid_w)
-
-    def apply(self, image, mask, rand_h, rand_w, angle, **params):
-        h, w = image.shape[:2]
-        mask = F.rotate(mask, angle) if self.rotate[1] > 0 else mask
-        mask = mask[:,:,np.newaxis] if image.ndim == 3 else mask
-        image *= mask[rand_h:rand_h+h, rand_w:rand_w+w].astype(image.dtype)
-        return image
-
-    def get_params_dependent_on_targets(self, params):
-        img = params['image']
-        height, width = img.shape[:2]
-        self.init_masks(height, width)
-
-        mid = np.random.randint(len(self.masks))
-        mask = self.masks[mid]
-        rand_h = np.random.randint(self.rand_h_max[mid])
-        rand_w = np.random.randint(self.rand_w_max[mid])
-        angle = np.random.randint(self.rotate[0], self.rotate[1]) if self.rotate[1] > 0 else 0
-
-        return {'mask': mask, 'rand_h': rand_h, 'rand_w': rand_w, 'angle': angle}
-
-    @property
-    def targets_as_params(self):
-        return ['image']
-
-    def get_transform_init_args_names(self):
-        return ('num_grid', 'fill_value', 'rotate', 'mode')
+    targets1, targets2,targets3, targets4,targets5, targets6, lam = targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
+    criterion2 = nn.CrossEntropyLoss(reduction='mean')
+    return lam * criterion2(preds1, targets1) + (1 - lam) * criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
 
 
 
 trans = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
-        transforms.ColorJitter(0.1, 0.1, 0.1),
+        transforms.ColorJitter(0.4, 0.4, 0.4),
         transforms.RandomAffine(degrees=10,translate=(0.15,0.15),scale=[0.8,1.2]), #Bengarli baseline
         transforms.ToTensor(),  #Take Image as input and convert to tensor with value from 0 to1  
 #         transforms.Normalize(mean=[0.05302372],std=[0.15948994]) #train_images distribution
@@ -244,10 +166,6 @@ trans = transforms.Compose([
 trans_none = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),
-])
-
-trans_gridmask = albumentations.Compose([
-    GridMask(num_grid=(7,7),rotate=30, p=1.5),
 ])
 
 trans_val = transforms.Compose([
@@ -283,17 +201,8 @@ class BengaliDataset(Dataset):
         
         img = np.uint8(self.data[idx]) #(137,236), value: 0~255
         labels = self.label[idx] #(num,3) grapheme_root, vowel_diacritic, constant_diacritic
-        
-        if np.random.random() < GRIDMASK_RATE:
-            img = cv2.resize(img, IMAGE_SIZE)
-            res = trans_gridmask(image=img)
-            img = res['image'].astype(np.float32)
-            img = Image.fromarray(img)
-            img = trans_none(img)
-        else:
-            img = Image.fromarray(img)
-            img = self.transform(img)     #value: 0~1, shape:(1,137,236)
-
+        img = Image.fromarray(img)
+        img = self.transform(img)     #value: 0~1, shape:(1,137,236)
         label = torch.as_tensor(labels, dtype=torch.uint8)    #value: 0~9, shape(3)
         return img, labels
 
@@ -323,18 +232,18 @@ def get_kfold_dataset_loader(k=5,val_rate=0.1,indices_len=None, batch_size=None,
 
 def get_model(model_type="50", pretrained=False):
 #     model = SE_Net3(in_channels=1)
-#     model = EffNet(in_channels=1)
+    # model = EffNet(in_channels=1)
     model = get_resnext_model(model_type=model_type, pretrained=pretrained)
     if device == "cuda":
         model.cuda()
     return model
 
 if __name__ == "__main__":
-    epochs = 300
+    epochs = 120
     ensemble_models = []
-    lr = 1e-3
-    batch_size = 96
-    val_period = 1333
+    lr = 1e-5
+    batch_size = 128
+    val_period = 1000
     train_period = 100
     num_workers = 12
     k = 1
@@ -342,14 +251,53 @@ if __name__ == "__main__":
     vr = 0.15
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0205/seresnext50_b96_vp1333_224x224_pre1_cutmix1_Gridmask0.3_lr1e-3_vr0.15_cosann_model_train"
+    save_file_name = "./B_saved_model_0205/sgd_seresnext50_b128_vp1000_224x224_pre1_cutmix1_noExtraAug_vr0.15_ocp0.15_div1000"
     print(save_file_name)
 
-    if OHEM_RATE > 0:
-        criterion = ohem_loss
-    else:    
-        criterion = torch.nn.CrossEntropyLoss()
-        
+    criterion = torch.nn.CrossEntropyLoss()
+
+    ###LR Finder
+    # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
+    # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
+    # trainloader = train_loaders[0]
+    # lr_finder.range_test(trainloader, end_lr=100, num_iter=100)
+    # lr_finder.plot() # to inspect the loss-learning rate graph
+    # lr_finder.reset() # to reset the model and optimizer to their initial state
+    # print("Done!")
+
+    ###LR Finder Leslie Smith's approach
+    # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, momentum=0.9, weight_decay=1e-2)
+    # trainloader = train_loaders[0]
+    # val_loader = val_loaders[0]
+    # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
+    # lr_finder.range_test(trainloader, val_loader=val_loader, end_lr=1, num_iter=100, step_mode="linear")
+    # lr_finder.plot(log_lr=False)
+    # lr_finder.reset()
+    # print("Done")
+    # stop
+
+    ###Check one cycle policy
+    # epoch = 100
+    # bs = 32 
+    # ### prcnt -> percentage of last steps, div-> max_lr/div = min_lr
+    # onecycle = OneCycle.OneCycle(indices_len*epoch /bs, 0.15, prcnt=10, div=1000, momentum_vals=(0.95, 0.8))
+    # lr_list = []
+    # for e in range(epoch):
+    #     for iterate in range(indices_len//bs):
+    #         lr, mom = onecycle.calc()
+    #         lr_list.append(lr)
+    # # print(np.array(lr_list))
+    # plt.xkcd()
+    # plt.xlabel("Iterations")
+    # plt.ylabel("Learning Rate")
+    # plt.xticks(np.arange(0, len(lr_list), step=100000), rotation=0)
+    # plt.plot(lr_list)
+    # plt.show()
+    # stop
+
+
     while True:
         print("Fold:",len(train_loaders))
         for fold in range(0,len(train_loaders)):
@@ -366,40 +314,43 @@ if __name__ == "__main__":
             loss_constant_avg = 0
 #             optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
     #         optimizer = torch.optim.SGD(model.parameters(),lr=lr)
+            # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.95, weight_decay=1e-4)
+            cycle_len = indices_len*(1-vr)*epochs/batch_size
+            onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=10, div=1000, momentum_vals=(0.95, 0.8))
+            # lr_scheduler = OneCycleLR(optimizer, num_steps=20, lr_range=(1e-5,0.15))
 #             optimizer = torch.optim.RMSprop(model.parameters(),lr=lr)
-            optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
+            # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
     #         optimizer = torch.optim.Adagrad(model.parameters(),lr=lr)
     #         optimizer = adabound.AdaBound(model.parameters(), lr=lr, final_lr=0.01,amsbound=True)
-    #         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=15,T_mult=2,eta_min=1e-5) #original 
-            # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=15,factor=0.1)
+            # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+    #         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=period,T_mult=1,eta_min=1e-5) #original 
+            # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
+
             for ep in range(0,epochs+1):
                 model.train()
                 for idx, data in enumerate(train_loader):
-#                     if idx%10 == 0:
-#                         print(idx)
+                    ###Onecycle policy
+                    lr, mom = onecycle.calc()
+                    for g in optimizer.param_groups:
+                        g['lr'] = lr
+                    for g in optimizer.param_groups:
+                        g['momentum'] = mom
+                    
                     img, target = data
                     img, target = img.to(device), target.to(device,dtype=torch.long)
 
-
-                    ###Cutmix
                     cutmix_tag = True if np.random.random()<CUT_MIX_RATE else False
                     if USE_CUTMIX == True and cutmix_tag == True:
                         img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
-                    
-                    ###Mixup
-                    # mixup_tag = True if np.random.random()<MIXUP_RATE else False
-                    # if USE_MIXUP == True and mixup_tag == True:
-                    #     img, targets = mixup(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
             
                     pred_root, pred_vowel, pred_constant = model.new_forward(img)
+                    # pred_root, pred_vowel, pred_constant = model(img)
                     
                     ##Cutmix test
                     if USE_CUTMIX == True and cutmix_tag == True:
                         loss = cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
-#                         print(loss.item())
-                    elif USE_MIXUP == True and mixup_tag == True:
-                        loss = mixup_criterion(pred_root,pred_vowel,pred_constant,targets)
+#                         print(loss.item())                        
                     else:
                         loss_root = criterion(pred_root,target[:,0])
                         loss_vowel = criterion(pred_vowel,target[:,1])
@@ -414,6 +365,9 @@ if __name__ == "__main__":
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+
+                    ###Cosine annealing
+        #             lr_scheduler.step()                    
 
                     ###Validation
                     if idx!=0 and idx%val_period == 0:
@@ -433,6 +387,7 @@ if __name__ == "__main__":
                                 img, target = img.to(device), target.to(device,dtype=torch.long)
                                 tmp = model(img)
                                 pred_root, pred_vowel, pred_constant = model.new_forward(img)
+                                # pred_root, pred_vowel, pred_constant = model(img)
                                 
                                 val_loss_root += criterion(pred_root, target[:,0]).item()
                                 val_loss_vowel += criterion(pred_vowel, target[:,1]).item()
@@ -460,11 +415,12 @@ if __name__ == "__main__":
                         acc = (2*acc_root + acc_vowel + acc_constant)/4
                         val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
 
-#                         ###Plateau
-# #                         lr_scheduler.step(val_loss)               
-#                         lr_scheduler.step(-1*acc)
-                        ###Cosine annealing
-                        lr_scheduler.step()   
+                        ###Plateau
+                        # lr_scheduler.step(val_loss)               
+                        # lr_scheduler.step(-1*acc)
+                        
+                        ###Others                  
+                        # lr_scheduler.step()
 
                         if acc >= max_acc:
                             max_acc = acc
@@ -481,12 +437,11 @@ if __name__ == "__main__":
 
                         print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
                               .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
-                        
+
                         ##Don't forget change model back to train()
                         model.train()
 
-                ###Plateau
-                # if optimizer.param_groups[0]['lr'] < 1e-6:
+                # if optimizer.param_groups[0]['lr'] < 1e-5:
                 #     break         
                     
             ###K-Fold ensemble: Saved k best model for k dataloader
