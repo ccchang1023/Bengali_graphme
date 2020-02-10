@@ -8,12 +8,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import matplotlib.pyplot as plt
-# import pandas as pd
-
+import sklearn.metrics
 
 from torch_lr_finder import LRFinder
-# from onecyclelr.onecyclelr import OneCycleLR
 from One_Cycle_Policy import OneCycle
+from class_balanced_loss import get_cb_loss
+
+from apex import amp
 
 device = "cuda"
 
@@ -23,12 +24,19 @@ train_labels = np.load("./train_labels_shuffle_0202.npy")
 # train_images = np.load("./128x128_by_lafoss_shuffled.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
-IMAGE_SIZE = (224,224)
+IMAGE_SIZE = (128,128)
 MODEL_TYPE = "50"
 USE_CUTMIX = True
 CUT_MIX_RATE = 1
+
+USE_FOCAL_LOSS = False
+USE_CLASS_BALANCED_LOSS = False
 NO_EXTRA_AUG = True
 USE_PRETRAINED = True
+
+USE_AMP = False
+USE_MISH = False
+
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,26 +70,37 @@ class EffNet(nn.Module):
         out_constant = self._fc_constant(x)
         return out_root, out_vowel, out_constant
         
-        
 
 from se_resnet import *
+from se_resnet_mish import se_resnext50_32x4d_mish, Mish
 from collections import OrderedDict
 def get_resnext_model(model_type="101", pretrained=True):
     if model_type == "101":
         model = se_resnext101_32x4d(num_classes=1000, pretrained=pretrained)
     elif model_type== "50":
-        model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained)
+        if USE_MISH == True:
+            model = se_resnext50_32x4d_mish(num_classes=1000, pretrained=pretrained)
+        else:
+            model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained)
     else:
         print("!!!Wrong se_res model structure!!!")
         return
     inplanes = 64  ###inplanes above!!!
     input_channels = 1
-    layer0_modules = [
-        ('conv1', nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2,    
-                            padding=3, bias=False)),
-        ('bn1', nn.BatchNorm2d(inplanes)),
-        ('relu1', nn.ReLU(inplace=True)),
-    ]        
+    if USE_MISH == True:
+        layer0_modules = [
+            ('conv1', nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2,    
+                                padding=3, bias=False)),
+            ('bn1', nn.BatchNorm2d(inplanes)),
+            ('mish1', Mish()),
+        ]        
+    else:
+        layer0_modules = [
+            ('conv1', nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2,    
+                                padding=3, bias=False)),
+            ('bn1', nn.BatchNorm2d(inplanes)),
+            ('relu1', nn.ReLU(inplace=True)),
+        ]           
     layer0_modules.append(('pool', nn.MaxPool2d(3, stride=2,ceil_mode=True)))
     model.layer0 = nn.Sequential(OrderedDict(layer0_modules))
     model.classifier_root = nn.Linear(model.feature_dim, 168)
@@ -89,6 +108,47 @@ def get_resnext_model(model_type="101", pretrained=True):
     model.classifier_constant = nn.Linear(model.feature_dim, 7)
     return model
 
+
+
+
+def get_dataset_mean_std(dataloader):
+    print("Calculate distribution:")
+    mean = 0.
+    std = 0.
+    nb_samples = 0.
+    for data in dataloader:
+        img = data[0].to(device)
+        batch_samples = img.size(0)
+        img = img.contiguous().view(batch_samples, img.size(1), -1)
+        mean += img.mean(2).sum(0)
+        std += img.std(2).sum(0)
+        nb_samples += batch_samples
+        if nb_samples%5120 == 0:
+            print("Finished:", nb_samples)
+    print("num of samples:",nb_samples)
+    mean /= nb_samples
+    std /= nb_samples
+    # print("Average mean:",mean)
+    # print("Average std:", std)
+    return mean.cpu().numpy(), std.cpu().numpy()
+
+
+
+class FocalLossWithOutOneHot(nn.Module):
+    def __init__(self, gamma=2, eps=1e-7):
+        super(FocalLossWithOutOneHot, self).__init__()
+        self.gamma = gamma
+        self.eps = eps
+
+    def forward(self, input, target):
+        logit = F.softmax(input, dim=1)
+        logit = logit.clamp(self.eps, 1. - self.eps)
+        logit_ls = torch.log(logit)
+        loss = F.nll_loss(logit_ls, target, reduction="none")
+        view = target.size() + (1,)
+        index = target.view(*view)
+        loss = loss * (1 - logit.gather(1, index).squeeze(1)) ** self.gamma # focal loss
+        return 0.01*loss.sum()
 
 def rand_bbox(size, lam):
     W = size[2]
@@ -126,8 +186,17 @@ def cutmix(data, targets1, targets2, targets3, alpha):
 def cutmix_criterion(preds1,preds2,preds3, targets):
     targets1, targets2,targets3, targets4,targets5, targets6, lam = \
     targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
-    criterion2 = nn.CrossEntropyLoss(reduction='mean')
     
+    if USE_CLASS_BALANCED_LOSS == True:
+        criterion2 = get_cb_loss
+    elif USE_FOCAL_LOSS == True:
+        criterion2 = FocalLossWithOutOneHot(gamma=2)
+    else:
+        criterion2 = nn.CrossEntropyLoss(reduction='mean')
+
+    # tmp_loss = criterion2(preds3, targets5)
+    # print("here",tmp_loss)
+
 #     print("here", preds1.size(), np.shape(targets1))
     return lam * criterion2(preds1, targets1) + (1 - lam) * \
            criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * \
@@ -154,24 +223,39 @@ def mixup_criterion(preds1,preds2,preds3, targets):
     return lam * criterion2(preds1, targets1) + (1 - lam) * criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
 
 
+def get_score(preds,targets):
+    scores = []
+    for i in range(3):
+        # print("t shape:",np.shape(targets[i]))
+        # print("p shape:",np.shape(preds[i]))
+        # print(targets)
+        # print(preds)
+        scores.append(sklearn.metrics.recall_score(targets[i],preds[i], average='macro'))
+    final_score = np.average(scores, weights=[2,1,1])
+    return final_score
+
 
 trans = transforms.Compose([
-        transforms.Resize(IMAGE_SIZE), #For resnet
-        transforms.ColorJitter(0.4, 0.4, 0.4),
-        transforms.RandomAffine(degrees=10,translate=(0.15,0.15),scale=[0.8,1.2]), #Bengarli baseline
+        ###Weak1
+        transforms.Resize(IMAGE_SIZE),
+        transforms.ColorJitter(0.1, 0.1, 0.1),
+        transforms.RandomAffine(degrees=3,translate=(0.05,0.05),scale=[0.95,1.05],shear=3),
         transforms.ToTensor(),  #Take Image as input and convert to tensor with value from 0 to1  
-#         transforms.Normalize(mean=[0.05302372],std=[0.15948994]) #train_images distribution
+        transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
+        # transforms.Normalize(mean=[0.0530355],std=[[0.15949783]]) #train_images 224x224 vr 0
     ])
 
 trans_none = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),
+        transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
+
 ])
 
 trans_val = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),  #Take Image as input and convert to tensor with value from 0 to1  
-#         transforms.Normalize(mean=[0.05302372],std=[0.15948994]) #train_images distribution
+        transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
     ])
 
 class BengaliDataset(Dataset):
@@ -239,32 +323,37 @@ def get_model(model_type="50", pretrained=False):
     return model
 
 if __name__ == "__main__":
-    epochs = 120
+    epochs = 160
     ensemble_models = []
     lr = 1e-5
-    batch_size = 128
-    val_period = 1000
-    train_period = 100
+    batch_size = 256
+    val_period = 500
+    train_period = 1
     num_workers = 12
     k = 1
     indices_len = 200840
-    vr = 0.15
+    vr = 0
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0205/sgd_seresnext50_b128_vp1000_224x224_pre1_cutmix1_noExtraAug_vr0.15_ocp0.15_div1000"
+    save_file_name = "./B_saved_model_0208/ocp0.15_prcnt10_div50_EP160_b256_vp500_128x128_pre1_cutmix1_noExtraAug_norm_vr0.15"
     print(save_file_name)
 
-    criterion = torch.nn.CrossEntropyLoss()
+    if USE_FOCAL_LOSS == True:
+        criterion = FocalLossWithOutOneHot(gamma=2)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
+
 
     ###LR Finder
     # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.90)
     # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
     # trainloader = train_loaders[0]
     # lr_finder.range_test(trainloader, end_lr=100, num_iter=100)
     # lr_finder.plot() # to inspect the loss-learning rate graph
     # lr_finder.reset() # to reset the model and optimizer to their initial state
     # print("Done!")
+    # stop
 
     ###LR Finder Leslie Smith's approach
     # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
@@ -298,156 +387,203 @@ if __name__ == "__main__":
     # stop
 
 
-    while True:
-        print("Fold:",len(train_loaders))
-        for fold in range(0,len(train_loaders)):
-            train_loader = train_loaders[fold]
-            val_loader = val_loaders[fold]
-            model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
-            max_acc = 0
-            min_loss = 10000
-            best_model_dict = None
-            data_num = 0
-            loss_avg = 0
-            loss_root_avg = 0
-            loss_vowel_avg = 0
-            loss_constant_avg = 0
-#             optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
-    #         optimizer = torch.optim.SGD(model.parameters(),lr=lr)
-            # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
-            optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.95, weight_decay=1e-4)
-            cycle_len = indices_len*(1-vr)*epochs/batch_size
-            onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=10, div=1000, momentum_vals=(0.95, 0.8))
-            # lr_scheduler = OneCycleLR(optimizer, num_steps=20, lr_range=(1e-5,0.15))
+    print("Fold:",len(train_loaders))
+    for fold in range(0,len(train_loaders)):
+        train_loader = train_loaders[fold]
+        val_loader = val_loaders[fold]
+
+        ###Calculate mean and std
+        # mean, std = get_dataset_mean_std(train_loader)
+        # print("Average mean:",mean)
+        # print("Average std:", std)
+
+        model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
+        max_acc = 0
+        min_loss = 10000
+        best_model_dict = None
+        data_num = 0
+        loss_avg = 0
+        loss_root_avg = 0
+        loss_vowel_avg = 0
+        loss_constant_avg = 0
+#       optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
+#       optimizer = torch.optim.SGD(model.parameters(),lr=lr)
+        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.95, weight_decay=1e-4)
+        cycle_len = indices_len*(1-vr)*epochs/batch_size
+        onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=10, div=50, momentum_vals=(0.95, 0.8))
+        # lr_scheduler = OneCycleLR(optimizer, num_steps=20, lr_range=(1e-5,0.15))
 #             optimizer = torch.optim.RMSprop(model.parameters(),lr=lr)
-            # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
-    #         optimizer = torch.optim.Adagrad(model.parameters(),lr=lr)
-    #         optimizer = adabound.AdaBound(model.parameters(), lr=lr, final_lr=0.01,amsbound=True)
-            # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-    #         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=period,T_mult=1,eta_min=1e-5) #original 
-            # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
+        # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
+#         optimizer = torch.optim.Adagrad(model.parameters(),lr=lr)
+#         optimizer = adabound.AdaBound(model.parameters(), lr=lr, final_lr=0.01,amsbound=True)
+        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
+#         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=period,T_mult=1,eta_min=1e-5) #original 
+        # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
 
-            for ep in range(0,epochs+1):
-                model.train()
-                for idx, data in enumerate(train_loader):
-                    ###Onecycle policy
-                    lr, mom = onecycle.calc()
-                    for g in optimizer.param_groups:
-                        g['lr'] = lr
-                    for g in optimizer.param_groups:
-                        g['momentum'] = mom
-                    
-                    img, target = data
-                    img, target = img.to(device), target.to(device,dtype=torch.long)
+        if USE_AMP == True:
+            model, optimizer = model, optimizer = amp.initialize(model, optimizer, opt_level="O2",
+                                                                 keep_batchnorm_fp32=True, loss_scale="dynamic")
 
-                    cutmix_tag = True if np.random.random()<CUT_MIX_RATE else False
-                    if USE_CUTMIX == True and cutmix_tag == True:
-                        img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
-            
-                    pred_root, pred_vowel, pred_constant = model.new_forward(img)
-                    # pred_root, pred_vowel, pred_constant = model(img)
-                    
-                    ##Cutmix test
-                    if USE_CUTMIX == True and cutmix_tag == True:
-                        loss = cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
-#                         print(loss.item())                        
-                    else:
-                        loss_root = criterion(pred_root,target[:,0])
-                        loss_vowel = criterion(pred_vowel,target[:,1])
-                        loss_constant = criterion(pred_constant,target[:,2])
-                        loss = loss_root + loss_vowel + loss_constant
-                        loss_root_avg += loss_root.item()
-                        loss_vowel_avg += loss_vowel.item()
-                        loss_constant_avg += loss_constant.item()
-                        loss_avg += loss.item()
+        for ep in range(0,epochs+1):
+            model.train()
+            for idx, data in enumerate(train_loader):
+                ###Onecycle policy
+                lr, mom = onecycle.calc()
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
+                for g in optimizer.param_groups:
+                    g['momentum'] = mom
+                
+                img, target = data
+                img, target = img.to(device), target.to(device,dtype=torch.long)
 
-                    data_num += img.size(0)
-                    optimizer.zero_grad()
+                cutmix_tag = True if np.random.random()<CUT_MIX_RATE else False
+                if USE_CUTMIX == True and cutmix_tag == True:
+                    img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
+        
+                # pred_root, pred_vowel, pred_constant = model.new_forward(img)
+                pred_root, pred_vowel, pred_constant = model(img)
+                
+                ##Cutmix test
+                if USE_CUTMIX == True and cutmix_tag == True:
+                    loss = cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
+                    # print(loss.item())                        
+                else:
+                    loss_root = criterion(pred_root,target[:,0])
+                    loss_vowel = criterion(pred_vowel,target[:,1])
+                    loss_constant = criterion(pred_constant,target[:,2])
+                    loss = loss_root + loss_vowel + loss_constant
+                    loss_root_avg += loss_root.item()
+                    loss_vowel_avg += loss_vowel.item()
+                    loss_constant_avg += loss_constant.item()
+                    loss_avg += loss.item()
+
+
+                # print(loss.item())
+                data_num += img.size(0)
+                optimizer.zero_grad()
+
+                if USE_AMP == True:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
                     loss.backward()
-                    optimizer.step()
 
-                    ###Cosine annealing
-        #             lr_scheduler.step()                    
+                optimizer.step()
 
-                    ###Validation
-                    if idx!=0 and idx%val_period == 0:
-                        model.eval()
-                        acc_root = 0
-                        acc_vowel = 0
-                        acc_constant = 0
-                        acc = 0
-                        val_loss_root = 0
-                        val_loss_vowel = 0
-                        val_loss_constant = 0
-                        val_loss = 0
-                        data_num  = 0
-                        with torch.no_grad():
-                            for idx, data in enumerate(val_loader):
-                                img, target = data
-                                img, target = img.to(device), target.to(device,dtype=torch.long)
-                                tmp = model(img)
-                                pred_root, pred_vowel, pred_constant = model.new_forward(img)
-                                # pred_root, pred_vowel, pred_constant = model(img)
-                                
-                                val_loss_root += criterion(pred_root, target[:,0]).item()
-                                val_loss_vowel += criterion(pred_vowel, target[:,1]).item()
-                                val_loss_constant += criterion(pred_constant, target[:,2]).item()
+                ###Cosine annealing
+    #             lr_scheduler.step()                    
 
-                                # print(pred) 
-                                _,pred_class_root = torch.max(pred_root.data, 1)
-                                _,pred_class_vowel = torch.max(pred_vowel.data, 1)
-                                _,pred_class_constant = torch.max(pred_constant.data, 1)
+                ###Validation
+                if idx!=0 and idx%val_period == 0:
+                    model.eval()
+                    acc_root = 0
+                    acc_vowel = 0
+                    acc_constant = 0
+                    acc = 0
+                    val_loss_root = 0
+                    val_loss_vowel = 0
+                    val_loss_constant = 0
+                    val_loss = 0
+                    data_num  = 0
 
-            #                   print(pred_class)
-                                acc_root += (pred_class_root == target[:,0]).sum().item()
-                                acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
-                                acc_constant += (pred_class_constant == target[:,2]).sum().item()
+                    r_preds = []
+                    v_preds = []
+                    c_preds = []
+                    r_targets = []
+                    v_targets = []
+                    c_targets = []
 
-                                data_num += img.size(0)
+                    with torch.no_grad():
+                        for idx, data in enumerate(val_loader):
+                            img, target = data
+                            img, target = img.to(device), target.to(device,dtype=torch.long)
+                            tmp = model(img)
+                            # pred_root, pred_vowel, pred_constant = model.new_forward(img)
+                            pred_root, pred_vowel, pred_constant = model(img)
+                            
+                            val_loss_root += criterion(pred_root, target[:,0]).item()
+                            val_loss_vowel += criterion(pred_vowel, target[:,1]).item()
+                            val_loss_constant += criterion(pred_constant, target[:,2]).item()
 
-                        acc_root /= data_num
-                        acc_vowel /= data_num
-                        acc_constant /= data_num
-                        val_loss_root /= data_num
-                        val_loss_vowel /= data_num
-                        val_loss_constant /= data_num
+                            # print(pred) 
+                            _,pred_class_root = torch.max(pred_root.data, 1)
+                            _,pred_class_vowel = torch.max(pred_vowel.data, 1)
+                            _,pred_class_constant = torch.max(pred_constant.data, 1)
 
-                        acc = (2*acc_root + acc_vowel + acc_constant)/4
-                        val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
+                            ###Origin metric
+                            # acc_root += (pred_class_root == target[:,0]).sum().item()
+                            # acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
+                            # acc_constant += (pred_class_constant == target[:,2]).sum().item()
+                            # data_num += img.size(0)
 
-                        ###Plateau
-                        # lr_scheduler.step(val_loss)               
-                        # lr_scheduler.step(-1*acc)
-                        
-                        ###Others                  
-                        # lr_scheduler.step()
+                            ###Contest metric
+                            r_preds.append(pred_class_root.cpu().numpy())
+                            v_preds.append(pred_class_vowel.cpu().numpy())
+                            c_preds.append(pred_class_constant.cpu().numpy())
+                            r_targets.append(target[:,0].cpu().numpy())
+                            v_targets.append(target[:,1].cpu().numpy())
+                            c_targets.append(target[:,2].cpu().numpy())
 
-                        if acc >= max_acc:
-                            max_acc = acc
-                            min_loss = val_loss
-                            best_model_dict = model.state_dict()                    
-                            if max_acc>0.98:
-                                torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,fold,max_acc*1e2))
-                        torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,fold))
-                        
-        #                 if val_loss <= min_loss:
-        #                     max_acc = acc
-        #                     min_loss = val_loss
-        #                     best_model_dict = model.state_dict()
+                    ###Origin metric
+                    # acc_root /= data_num
+                    # acc_vowel /= data_num
+                    # acc_constant /= data_num
+                    # val_loss_root /= data_num
+                    # val_loss_vowel /= data_num
+                    # val_loss_constant /= data_num
+                    # acc = (2*acc_root + acc_vowel + acc_constant)/4
+                    # val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
 
-                        print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
-                              .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
+                    ####Contest metric
+                    r_preds = [tmp_j for tmp_i in r_preds for tmp_j in tmp_i]
+                    v_preds = [tmp_j for tmp_i in v_preds for tmp_j in tmp_i]
+                    c_preds = [tmp_j for tmp_i in c_preds for tmp_j in tmp_i]
+                    r_targets = [tmp_j for tmp_i in r_targets for tmp_j in tmp_i]
+                    v_targets = [tmp_j for tmp_i in v_targets for tmp_j in tmp_i]
+                    c_targets = [tmp_j for tmp_i in c_targets for tmp_j in tmp_i]
+                    acc = get_score([r_preds,v_preds,c_preds],[r_targets,v_targets,c_targets])
+                    # print("final score:",acc)
 
-                        ##Don't forget change model back to train()
-                        model.train()
-
-                # if optimizer.param_groups[0]['lr'] < 1e-5:
-                #     break         
+                    ###Plateau
+                    # lr_scheduler.step(val_loss)               
+                    # lr_scheduler.step(-1*acc)
                     
-            ###K-Fold ensemble: Saved k best model for k dataloader
-            print("===================Best Fold:{} Saved Loss:{} Acc:{}==================".format(fold,min_loss,max_acc))
-            torch.save(best_model_dict, "{}_Fold{}_loss{:.4f}_acc{:.3f}".format(save_file_name,fold,min_loss*1e3,max_acc*1e2))
-            print("======================================================")
+                    ###Others                  
+                    # lr_scheduler.step()
 
-            del model
-            torch.cuda.empty_cache()
+                    ###Origin metric
+                    # print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
+                    #         .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
+
+                    ###Contest metric
+                    print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,lr:{}"
+                            .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,optimizer.param_groups[0]['lr']))
+
+                    if acc >= max_acc:
+                        max_acc = acc
+                        min_loss = val_loss
+                        best_model_dict = model.state_dict()                    
+                        if max_acc>0.98:
+                            torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,fold,max_acc*1e2))
+                    torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,fold))
+                    
+    #                 if val_loss <= min_loss:
+    #                     max_acc = acc
+    #                     min_loss = val_loss
+    #                     best_model_dict = model.state_dict()
+
+                    ##Don't forget change model back to train()
+                    model.train()
+
+            # if optimizer.param_groups[0]['lr'] < 1e-5:
+            #     break         
+                
+        ###K-Fold ensemble: Saved k best model for k dataloader
+        print("===================Best Fold:{} Saved Loss:{} Acc:{}==================".format(fold,min_loss,max_acc))
+        torch.save(best_model_dict, "{}_Fold{}_loss{:.4f}_acc{:.3f}".format(save_file_name,fold,min_loss*1e3,max_acc*1e2))
+        print("======================================================")
+
+        del model
+        torch.cuda.empty_cache()

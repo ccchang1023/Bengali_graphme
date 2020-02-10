@@ -4,6 +4,18 @@ from collections import OrderedDict
 import torch.nn as nn
 from torch.utils import model_zoo
 
+import torch
+import torch.nn.functional as F  #(uncomment if needed,but you likely already have it)
+#Mish - "Mish: A Self Regularized Non-Monotonic Neural Activation Function"
+class Mish(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        #inlining this saves 1 second per epoch (V100 GPU) vs having a temp x and then returning x(!)
+        return x *( torch.tanh(F.softplus(x)))
+
+
 __all__ = [
     'senet154', 'se_resnet50', 'se_resnet101', 'se_resnet152',
     'se_resnext50_32x4d', 'se_resnext101_32x4d', 'se_resnet50_fc512'
@@ -96,7 +108,7 @@ class SEModule(nn.Module):
         self.fc1 = nn.Conv2d(
             channels, channels // reduction, kernel_size=1, padding=0
         )
-        self.relu = nn.ReLU(inplace=True)
+        self.mish = Mish()
         self.fc2 = nn.Conv2d(
             channels // reduction, channels, kernel_size=1, padding=0
         )
@@ -106,7 +118,7 @@ class SEModule(nn.Module):
         module_input = x
         x = self.avg_pool(x)
         x = self.fc1(x)
-        x = self.relu(x)
+        x = self.mish(x)
         x = self.fc2(x)
         x = self.sigmoid(x)
         return module_input * x
@@ -122,11 +134,11 @@ class Bottleneck(nn.Module):
 
         out = self.conv1(x)
         out = self.bn1(out)
-        out = self.relu(out)
+        out = self.mish(out)
 
         out = self.conv2(out)
         out = self.bn2(out)
-        out = self.relu(out)
+        out = self.mish(out)
 
         out = self.conv3(out)
         out = self.bn3(out)
@@ -135,7 +147,7 @@ class Bottleneck(nn.Module):
             residual = self.downsample(x)
 
         out = self.se_module(out) + residual
-        out = self.relu(out)
+        out = self.mish(out)
 
         return out
 
@@ -166,7 +178,7 @@ class SEBottleneck(Bottleneck):
             planes * 4, planes * 4, kernel_size=1, bias=False
         )
         self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
+        self.mish = Mish()
         self.se_module = SEModule(planes * 4, reduction=reduction)
         self.downsample = downsample
         self.stride = stride
@@ -199,7 +211,7 @@ class SEResNetBottleneck(Bottleneck):
         self.bn2 = nn.BatchNorm2d(planes)
         self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
+        self.mish = Mish()
         self.se_module = SEModule(planes * 4, reduction=reduction)
         self.downsample = downsample
         self.stride = stride
@@ -237,7 +249,7 @@ class SEResNeXtBottleneck(Bottleneck):
         self.bn2 = nn.BatchNorm2d(width)
         self.conv3 = nn.Conv2d(width, planes * 4, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm2d(planes * 4)
-        self.relu = nn.ReLU(inplace=True)
+        self.mish = Mish()
         self.se_module = SEModule(planes * 4, reduction=reduction)
         self.downsample = downsample
         self.stride = stride
@@ -329,13 +341,13 @@ class SENet(nn.Module):
                     nn.Conv2d(3, 64, 3, stride=2, padding=1, bias=False)
                 ),
                 ('bn1', nn.BatchNorm2d(64)),
-                ('relu1', nn.ReLU(inplace=True)),
+                ('mish1', Mish()),
                 (
                     'conv2',
                     nn.Conv2d(64, 64, 3, stride=1, padding=1, bias=False)
                 ),
                 ('bn2', nn.BatchNorm2d(64)),
-                ('relu2', nn.ReLU(inplace=True)),
+                ('mish2', Mish()),
                 (
                     'conv3',
                     nn.Conv2d(
@@ -343,7 +355,7 @@ class SENet(nn.Module):
                     )
                 ),
                 ('bn3', nn.BatchNorm2d(inplanes)),
-                ('relu3', nn.ReLU(inplace=True)),
+                ('mish3', Mish()),
             ]
         else:
             layer0_modules = [
@@ -359,7 +371,7 @@ class SENet(nn.Module):
                     )
                 ),
                 ('bn1', nn.BatchNorm2d(inplanes)),
-                ('relu1', nn.ReLU(inplace=True)),
+                ('mish1', Mish()),
             ]
         # To preserve compatibility with Caffe weights `ceil_mode=True`
         # is used instead of `padding=1`.
@@ -476,7 +488,7 @@ class SENet(nn.Module):
         for dim in fc_dims:
             layers.append(nn.Linear(input_dim, dim))
             layers.append(nn.BatchNorm1d(dim))
-            layers.append(nn.ReLU(inplace=True))
+            layers.append(Mish())
             if dropout_p is not None:
                 layers.append(nn.Dropout(p=dropout_p))
             input_dim = dim
@@ -654,7 +666,7 @@ def se_resnet152(num_classes, loss='softmax', pretrained=True, **kwargs):
     return model
 
 
-def se_resnext50_32x4d(num_classes, loss='softmax', pretrained=True, **kwargs):
+def se_resnext50_32x4d_mish(num_classes, loss='softmax', pretrained=True, **kwargs):
     model = SENet(
         num_classes=num_classes,
         loss=loss,
