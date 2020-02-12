@@ -16,6 +16,7 @@ from torch_lr_finder import LRFinder
 from One_Cycle_Policy import OneCycle
 from class_balanced_loss import get_cb_loss
 from apex import amp
+import cv2
 
 device = "cuda"
 
@@ -26,9 +27,11 @@ train_labels = np.load("./train_labels_shuffle_0202.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
 IMAGE_SIZE = (224,224)
-MODEL_TYPE = "101"
+MODEL_TYPE = "50"
 USE_CUTMIX = True
-CUT_MIX_RATE = 0.7
+CUT_MIX_RATE = 0.6
+POST_AUG_RATE = 0.2
+MOR_AUG_RATE = 0.2
 
 USE_FOCAL_LOSS = False
 USE_CLASS_BALANCED_LOSS = False
@@ -39,38 +42,9 @@ USE_PRETRAINED = True
 USE_AMP = True
 USE_MISH = False
 
+
 import torch.nn as nn
 import torch.nn.functional as F
-from efficientnet_pytorch import EfficientNet
-# model = EfficientNet.from_pretrained('efficientnet-b3')
-
-# out_channels = 1280  #eff-b0
-# out_channels = 1536  #eff-b3
-# out_channels = 2560  #eff-b7
-
-class EffNet(nn.Module):
-    def __init__(self,in_channels=3):
-        super().__init__()
-        self.backbone = EfficientNet.from_pretrained('efficientnet-b7',in_channels=in_channels)
-        self._avg_pooling = nn.AdaptiveAvgPool2d(1)
-        self._dropout = nn.Dropout(0.2)
-        self._fc_root = nn.Linear(out_channels, 168)
-        self._fc_vowel = nn.Linear(out_channels, 11)
-        self._fc_constant = nn.Linear(out_channels, 7)
-    def forward(self, inputs):
-        bs = inputs.size(0)
-        # Convolution layers
-        x = self.backbone.extract_features(inputs)
-#         print("feature size:", x.size())
-        # Pooling and final linear layer
-        x = self._avg_pooling(x)
-        x = x.view(bs, -1)
-        x = self._dropout(x)
-        out_root = self._fc_root(x)
-        out_vowel = self._fc_vowel(x)
-        out_constant = self._fc_constant(x)
-        return out_root, out_vowel, out_constant
-        
 
 from se_resnet import *
 from se_resnet_mish import se_resnext50_32x4d_mish, Mish
@@ -109,27 +83,6 @@ def get_resnext_model(model_type="101", pretrained=True):
     model.classifier_constant = nn.Linear(model.feature_dim, 7)
     return model
 
-from wide_resnet import *
-# from my_torchvision.models import *
-def get_wideRes_model(model_type="50", pretrained=True):
-    if model_type == "101":
-        model = wide_resnet101_2(num_classes=1000, pretrained=pretrained)
-    elif model_type== "50":
-        model = wide_resnet50_2(num_classes=1000, pretrained=pretrained)
-    else:
-        print("!!!Wrong se_res model structure!!!")
-        return
-
-    inplanes = 64  ###inplanes above!!!
-    input_channels = 1
-    expansion = 4
-    model.conv1 = nn.Conv2d(input_channels, inplanes, kernel_size=7, stride=2, padding=3,
-                        bias=False)
-    model.fc_r = nn.Linear(512 * expansion, 168)
-    model.fc_v = nn.Linear(512 * expansion, 11)
-    model.fc_c = nn.Linear(512 * expansion, 7)
-
-    return model
 
 
 
@@ -153,6 +106,15 @@ def get_dataset_mean_std(dataloader):
     # print("Average mean:",mean)
     # print("Average std:", std)
     return mean.cpu().numpy(), std.cpu().numpy()
+
+
+
+
+def get_augmented_img(img, func):
+    output_img = np.zeros((h * 2, w), dtype=np.uint8)
+    output_img[:h] = img
+    output_img[h:] = func(img)
+    return output_img
 
 
 
@@ -257,6 +219,7 @@ def get_score(preds,targets):
     return final_score
 
 
+
 trans_none = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),
@@ -293,6 +256,50 @@ trans_val = transforms.Compose([
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
         transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0        
     ])
+
+
+###Morphological Augmentation
+def trans_morphological(img):
+    return func_hybrid(img)
+
+def func_Erosion(img):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
+    img = cv2.erode(img, kernel, iterations=1)
+    return img
+
+def func_Dilation(img):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
+    img = cv2.dilate(img, kernel, iterations=1)
+    return img
+
+def get_random_kernel():
+    structure = np.random.choice([cv2.MORPH_RECT, cv2.MORPH_ELLIPSE, cv2.MORPH_CROSS])
+    kernel = cv2.getStructuringElement(structure, tuple(np.random.randint(1, 5, 2)))
+    return kernel
+
+def func_opening(img):
+    img = cv2.erode(img, get_random_kernel(), iterations=1)
+    img = cv2.dilate(img, get_random_kernel(), iterations=1)
+    return img
+
+def func_closing(img):
+    img = cv2.dilate(img, get_random_kernel(), iterations=1)
+    img = cv2.erode(img, get_random_kernel(), iterations=1)
+    return img
+
+def func_hybrid(img):
+    rand_tag = np.random.random()
+    if rand_tag < 0.25:
+        img = func_Erosion(img)
+    elif rand_tag < 0.5:
+        img = func_Dilation(img)
+    elif rand_tag < 0.75:
+        img = func_opening(img)
+    else:
+        img = func_closing(img)        
+    return img
+
+
 
 class BengaliDataset(Dataset):
     def __init__(self,data_len=None, is_validate=False,validate_rate=None,indices=None):
@@ -360,32 +367,24 @@ def get_model(model_type="50", pretrained=False):
 #     model = SE_Net3(in_channels=1)
     # model = EffNet(in_channels=1)
     model = get_resnext_model(model_type=model_type, pretrained=pretrained)
-    # model = get_wideRes_model(model_type=model_type, pretrained=pretrained)
     if device == "cuda":
         model.cuda()
-
-    # in_tensor = torch.zeros((1,1,128,128)).to(device)
-    # pred = model(in_tensor)
-    # print("output:",pred[0].size())
-    # print("output2:",pred[1].size())
-    # print("output3:",pred[2].size())
-
     return model
 
 if __name__ == "__main__":
     epochs = 200
     ensemble_models = []
     lr = 1e-5
-    batch_size = 128
-    val_period = 1000
+    batch_size = 200
+    val_period = 640
     train_period = 1
     num_workers = 12
     k = 1 
     indices_len = 200840
-    vr = 0.15
+    vr = 0.05
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0211/ocp0.15_prcnt20_div100_EP200_b128_vp1000_224x224_pre1_cutmix0.7_norm_vr0.15_fp16"
+    save_file_name = "./B_saved_model_0211/ocp0.15_prcnt20_div100_EP200_b200_vp640_224x224_pre1_cutmix0.6_augPost1_0.2_augMor0.2_norm_vr0.05_fp16"
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -489,20 +488,27 @@ if __name__ == "__main__":
                 img, target = data
                 img, target = img.to(device), target.to(device,dtype=torch.long)
                 
-                cutmix_tag = True if np.random.random()<CUT_MIX_RATE else False
+                tmp_rand = np.random.random()
+                cutmix_tag = True if tmp_rand<CUT_MIX_RATE else False
                 if USE_CUTMIX == True and cutmix_tag == True:
                     img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
                     ###Post Norm
                     for j in range(img.size(0)):
                         tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
+                        # print("here1",np.shape(tmp_img))
                         img[j] = tmp_img
-                    
-                else:
-                    # print(np.shape(img))   (batch,1,h,w)
+                elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE:
                     ###Post aug
                     for j in range(img.size(0)):
-                        tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
+                        tmp_img = trans_post(np.uint8(img[j][0].cpu().numpy()*255))
                         img[j] = tmp_img
+                elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE + MOR_AUG_RATE:
+                    ###Morphological aug
+                    for j in range(img.size(0)):
+                        tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
+                        tmp_img = trans_norm(tmp_img)     #(1,h,w)
+                        img[j] = tmp_img
+
 
                 # pred_root, pred_vowel, pred_constant = model.new_forward(img)
                 pred_root, pred_vowel, pred_constant = model(img)
@@ -527,8 +533,6 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
 
                 if USE_AMP == True:
-                    if IMAGE_SIZE == (224,224) or MODEL_TYPE=="101":
-                        loss = loss * 0.1
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
