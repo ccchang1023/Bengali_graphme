@@ -654,7 +654,7 @@ def se_resnet152(num_classes, loss='softmax', pretrained=True, **kwargs):
     return model
 
 
-def se_resnext50_32x4d(num_classes, loss='softmax', pretrained=True, **kwargs):
+def se_resnext50_32x4d(num_classes, loss='softmax', pretrained=True, dropout=None, **kwargs):
     model = SENet(
         num_classes=num_classes,
         loss=loss,
@@ -662,7 +662,7 @@ def se_resnext50_32x4d(num_classes, loss='softmax', pretrained=True, **kwargs):
         layers=[3, 4, 6, 3],
         groups=32,
         reduction=16,
-        dropout_p=None,
+        dropout_p=dropout,
         inplanes=64,
         input_3x3=False,
         downsample_kernel_size=1,
@@ -675,12 +675,11 @@ def se_resnext50_32x4d(num_classes, loss='softmax', pretrained=True, **kwargs):
         model_url = pretrained_settings['se_resnext50_32x4d']['imagenet']['url'
                                                                           ]
         init_pretrained_weights(model, model_url)
+        print("DP rate is ",dropout)
     return model
 
 
-def se_resnext101_32x4d(
-    num_classes, loss='softmax', pretrained=True, **kwargs
-):
+def se_resnext101_32x4d(num_classes, loss='softmax', pretrained=True,  dropout=None, **kwargs):
     model = SENet(
         num_classes=num_classes,
         loss=loss,
@@ -688,7 +687,7 @@ def se_resnext101_32x4d(
         layers=[3, 4, 23, 3],
         groups=32,
         reduction=16,
-        dropout_p=None,
+        dropout_p=dropout,
         inplanes=64,
         input_3x3=False,
         downsample_kernel_size=1,
@@ -701,4 +700,5 @@ def se_resnext101_32x4d(
         model_url = pretrained_settings['se_resnext101_32x4d']['imagenet'][
             'url']
         init_pretrained_weights(model, model_url)
+        print("DP rate is ",dropout)
     return model

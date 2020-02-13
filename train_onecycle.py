@@ -26,15 +26,16 @@ train_labels = np.load("./train_labels_shuffle_0202.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
 IMAGE_SIZE = (224,224)
-MODEL_TYPE = "101"
+MODEL_TYPE = "50"
 USE_CUTMIX = True
-CUT_MIX_RATE = 0.7
+CUT_MIX_RATE = 1
 
 USE_FOCAL_LOSS = False
 USE_CLASS_BALANCED_LOSS = False
 NO_EXTRA_AUG = True
 
 USE_PRETRAINED = True
+DROP_RATE = 0.4     ###If no dp, use None instead of 0
 
 USE_AMP = True
 USE_MISH = False
@@ -75,14 +76,14 @@ class EffNet(nn.Module):
 from se_resnet import *
 from se_resnet_mish import se_resnext50_32x4d_mish, Mish
 from collections import OrderedDict
-def get_resnext_model(model_type="101", pretrained=True):
+def get_resnext_model(model_type="101", pretrained=True, dropout=None):
     if model_type == "101":
-        model = se_resnext101_32x4d(num_classes=1000, pretrained=pretrained)
+        model = se_resnext101_32x4d(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
     elif model_type== "50":
         if USE_MISH == True:
-            model = se_resnext50_32x4d_mish(num_classes=1000, pretrained=pretrained)
+            model = se_resnext50_32x4d_mish(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
         else:
-            model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained)
+            model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
     else:
         print("!!!Wrong se_res model structure!!!")
         return
@@ -261,7 +262,7 @@ trans_none = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
-        # transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0
+        transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0
 ])
 
 trans_post = transforms.Compose([
@@ -277,14 +278,14 @@ trans_post = transforms.Compose([
 
         transforms.ToTensor(),
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]), #train_images 128x128 vr 0
-        transforms.Normalize(mean=[0.0530355],std=[0.15949783]), #train_images 224x224 vr 0 
+        # transforms.Normalize(mean=[0.0530355],std=[0.15949783]), #train_images 224x224 vr 0 
 ])
 
 trans_norm = transforms.Compose([
         transforms.ToPILImage(),
         transforms.ToTensor(),
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]), #train_images 128x128 vr 0
-        transforms.Normalize(mean=[0.0530355],std=[0.15949783]), #train_images 224x224 vr 0        
+        # transforms.Normalize(mean=[0.0530355],std=[0.15949783]), #train_images 224x224 vr 0        
 ])
 
 trans_val = transforms.Compose([
@@ -376,16 +377,16 @@ if __name__ == "__main__":
     epochs = 200
     ensemble_models = []
     lr = 1e-5
-    batch_size = 128
-    val_period = 1000
+    batch_size = 200
+    val_period = 640
     train_period = 1
     num_workers = 12
-    k = 1 
+    k = 1
     indices_len = 200840
     vr = 0.15
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0211/ocp0.15_prcnt20_div100_EP200_b128_vp1000_224x224_pre1_cutmix0.7_norm_vr0.15_fp16"
+    save_file_name = "./B_saved_model_0211/ocp0.15_prcnt20_div100_EP200_b200_vp640_224x224_pre1_cutmix1_norm_drop0.4_vr0.15_fp16"
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -493,16 +494,17 @@ if __name__ == "__main__":
                 if USE_CUTMIX == True and cutmix_tag == True:
                     img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
                     ###Post Norm
-                    for j in range(img.size(0)):
-                        tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
-                        img[j] = tmp_img
+                    # for j in range(img.size(0)):
+                    #     tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
+                    #     img[j] = tmp_img
                     
                 else:
+                    print("Shouldn't be here")
                     # print(np.shape(img))   (batch,1,h,w)
                     ###Post aug
-                    for j in range(img.size(0)):
-                        tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
-                        img[j] = tmp_img
+                    # for j in range(img.size(0)):
+                    #     tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
+                    #     img[j] = tmp_img
 
                 # pred_root, pred_vowel, pred_constant = model.new_forward(img)
                 pred_root, pred_vowel, pred_constant = model(img)
@@ -528,7 +530,7 @@ if __name__ == "__main__":
 
                 if USE_AMP == True:
                     if IMAGE_SIZE == (224,224) or MODEL_TYPE=="101":
-                        loss = loss * 0.1
+                        loss = loss * 0.5
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:

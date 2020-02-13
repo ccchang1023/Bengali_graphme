@@ -38,6 +38,8 @@ USE_CLASS_BALANCED_LOSS = False
 NO_EXTRA_AUG = True
 
 USE_PRETRAINED = True
+DROP_RATE = 0.2     ###If no dp, use None instead of 0
+
 
 USE_AMP = True
 USE_MISH = False
@@ -49,14 +51,14 @@ import torch.nn.functional as F
 from se_resnet import *
 from se_resnet_mish import se_resnext50_32x4d_mish, Mish
 from collections import OrderedDict
-def get_resnext_model(model_type="101", pretrained=True):
+def get_resnext_model(model_type="101", pretrained=True, dropout=None):
     if model_type == "101":
-        model = se_resnext101_32x4d(num_classes=1000, pretrained=pretrained)
+        model = se_resnext101_32x4d(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
     elif model_type== "50":
         if USE_MISH == True:
-            model = se_resnext50_32x4d_mish(num_classes=1000, pretrained=pretrained)
+            model = se_resnext50_32x4d_mish(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
         else:
-            model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained)
+            model = se_resnext50_32x4d(num_classes=1000, pretrained=pretrained,dropout=DROP_RATE)
     else:
         print("!!!Wrong se_res model structure!!!")
         return
