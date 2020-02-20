@@ -17,10 +17,19 @@ from One_Cycle_Policy import OneCycle
 from class_balanced_loss import get_cb_loss
 from apex import amp
 
-device = "cuda"
+import seaborn
 
-train_images = np.load("./train_images_invert_0203.npy")
-train_labels = np.load("./train_labels_shuffle_0202.npy")
+
+# device = "cuda"
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+# train_images = np.load("./train_images_invert_0203.npy")
+# train_labels = np.load("./train_labels_shuffle_0202.npy")
+
+train_images = np.load("./0220_ordered_232560_imgs.npy")
+train_labels = np.load("./0220_ordered_232560_labels.npy")
+# print(np.shape(train_images))
+# print(np.shape(train_labels))
 
 # train_images = np.load("./128x128_by_lafoss_shuffled.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
@@ -29,30 +38,38 @@ IMAGE_SIZE = (224,224)
 MODEL_TYPE = "50"
 USE_CUTMIX = True
 CUT_MIX_RATE = 1
+LAMBDA = 0.8
 
 USE_FOCAL_LOSS = False
 USE_CLASS_BALANCED_LOSS = False
+USE_LABEL_SMOOTHING = False
+
 NO_EXTRA_AUG = True
 
 USE_PRETRAINED = True
-DROP_RATE = 0.4     ###If no dp, use None instead of 0
+DROP_RATE = None     ###If no dp, use None instead of 0
 
 USE_AMP = True
 USE_MISH = False
 
+USE_MULTI_GPU = False
+
+FOLD=6
+
 import torch.nn as nn
 import torch.nn.functional as F
 from efficientnet_pytorch import EfficientNet
-# model = EfficientNet.from_pretrained('efficientnet-b3')
 
 # out_channels = 1280  #eff-b0
-# out_channels = 1536  #eff-b3
+out_channels = 1536  #eff-b3
+# out_channels = 1792  #eff-b4
+# out_channels = 2048  #eff-b5
 # out_channels = 2560  #eff-b7
 
 class EffNet(nn.Module):
     def __init__(self,in_channels=3):
         super().__init__()
-        self.backbone = EfficientNet.from_pretrained('efficientnet-b7',in_channels=in_channels)
+        self.backbone = EfficientNet.from_pretrained('efficientnet-b3',in_channels=in_channels)
         self._avg_pooling = nn.AdaptiveAvgPool2d(1)
         self._dropout = nn.Dropout(0.2)
         self._fc_root = nn.Linear(out_channels, 168)
@@ -62,7 +79,7 @@ class EffNet(nn.Module):
         bs = inputs.size(0)
         # Convolution layers
         x = self.backbone.extract_features(inputs)
-#         print("feature size:", x.size())
+        # print("feature size:", x.size())
         # Pooling and final linear layer
         x = self._avg_pooling(x)
         x = x.view(bs, -1)
@@ -72,7 +89,6 @@ class EffNet(nn.Module):
         out_constant = self._fc_constant(x)
         return out_root, out_vowel, out_constant
         
-
 from se_resnet import *
 from se_resnet_mish import se_resnext50_32x4d_mish, Mish
 from collections import OrderedDict
@@ -131,8 +147,6 @@ def get_wideRes_model(model_type="50", pretrained=True):
     model.fc_c = nn.Linear(512 * expansion, 7)
 
     return model
-
-
 
 def get_dataset_mean_std(dataloader):
     print("Calculate distribution:")
@@ -206,6 +220,44 @@ def cutmix(data, targets1, targets2, targets3, alpha):
     targets = [targets1, shuffled_targets1, targets2, shuffled_targets2, targets3, shuffled_targets3, lam]
     return data, targets
 
+
+def onehot_encoding(label, n_classes):
+    return torch.zeros(label.size(0), n_classes).to(label.device).scatter_(
+        1, label.view(-1, 1), 1)
+
+def cross_entropy_loss(input, target, reduction):
+    logp = F.log_softmax(input, dim=1)
+    loss = torch.sum(-logp * target, dim=1)
+    if reduction == 'none':
+        return loss
+    elif reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        raise ValueError(
+            '`reduction` must be one of \'none\', \'mean\', or \'sum\'.')
+
+def label_smoothing_criterion(epsilon=0.1, reduction='mean'):
+    def _label_smoothing_criterion(preds, targets):
+        n_classes = preds.size(1)
+        device = preds.device
+        onehot = onehot_encoding(targets, n_classes).float().to(device)
+        targets = onehot * (1 - epsilon) + torch.ones_like(onehot).to(
+            device) * epsilon / n_classes
+        loss = cross_entropy_loss(preds, targets, reduction)
+        if reduction == 'none':
+            return loss
+        elif reduction == 'mean':
+            return loss.mean()
+        elif reduction == 'sum':
+            return loss.sum()
+        else:
+            raise ValueError(
+                '`reduction` must be one of \'none\', \'mean\', or \'sum\'.')
+
+    return _label_smoothing_criterion
+
 def cutmix_criterion(preds1,preds2,preds3, targets):
     targets1, targets2,targets3, targets4,targets5, targets6, lam = \
     targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
@@ -214,6 +266,8 @@ def cutmix_criterion(preds1,preds2,preds3, targets):
         criterion2 = get_cb_loss
     elif USE_FOCAL_LOSS == True:
         criterion2 = FocalLossWithOutOneHot(gamma=2)
+    elif USE_LABEL_SMOOTHING == True:
+        criterion2 = label_smoothing_criterion()
     else:
         criterion2 = nn.CrossEntropyLoss(reduction='mean')
 
@@ -224,6 +278,8 @@ def cutmix_criterion(preds1,preds2,preds3, targets):
     return lam * criterion2(preds1, targets1) + (1 - lam) * \
            criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * \
            criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
+
+
 
 
 def mixup(data, targets1, targets2, targets3, alpha):
@@ -262,7 +318,7 @@ trans_none = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
-        transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0
+        # transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0
 ])
 
 trans_post = transforms.Compose([
@@ -292,7 +348,7 @@ trans_val = transforms.Compose([
         transforms.Resize(IMAGE_SIZE), #For resnet
         transforms.ToTensor(),  #Take Image as input and convert to tensor with value from 0 to1  
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
-        transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0        
+        # transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0        
     ])
 
 class BengaliDataset(Dataset):
@@ -342,10 +398,13 @@ def get_kfold_dataset_loader(k=5,val_rate=0.1,indices_len=None, batch_size=None,
     indices = np.arange(indices_len)
     val_len = indices_len//k
     idx = 0
+
     for i in range(k):
         ind = np.concatenate([indices[:idx],indices[idx+val_len:],indices[idx:idx+val_len]])
         idx += val_len
-        
+        if i!=FOLD:
+            continue
+        # print("here fold",FOLD,ind[:30],ind[-30:])
         train_dataset = BengaliDataset(data_len=None,is_validate=False, validate_rate=val_rate,indices=ind)
         val_dataset = BengaliDataset(data_len=None,is_validate=True, validate_rate=val_rate, indices=ind)
         
@@ -362,8 +421,10 @@ def get_model(model_type="50", pretrained=False):
     # model = EffNet(in_channels=1)
     model = get_resnext_model(model_type=model_type, pretrained=pretrained)
     # model = get_wideRes_model(model_type=model_type, pretrained=pretrained)
-    if device == "cuda":
-        model.cuda()
+    # if device == "cuda":
+    #     model.cuda()
+
+    model = model.to(device)
 
     # in_tensor = torch.zeros((1,1,128,128)).to(device)
     # pred = model(in_tensor)
@@ -374,19 +435,23 @@ def get_model(model_type="50", pretrained=False):
     return model
 
 if __name__ == "__main__":
-    epochs = 200
+    epochs = 180
     ensemble_models = []
     lr = 1e-5
     batch_size = 200
     val_period = 640
     train_period = 1
     num_workers = 12
-    k = 1
-    indices_len = 200840
-    vr = 0.15
+    k = 7
+    indices_len = 232560
+    
+    # vr = 0.15
+    # vr = 0.2
+    vr = 1/k
+
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0211/ocp0.15_prcnt20_div100_EP200_b200_vp640_224x224_pre1_cutmix1_norm_drop0.4_vr0.15_fp16"
+    save_file_name = "./B_saved_model_0218_ensemble/7folds_ordered_ocp0.15_prcnt15_div50_EP180_b200_vp640_224x224_pre1_cutmix1_fp16_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -394,10 +459,11 @@ if __name__ == "__main__":
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-
     ###LR Finder
     # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.90)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    # # optimizer = torch.optim.Adam(model.parameters(),lr=lr, betas=(0.9,0.99))
+
     # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
     # trainloader = train_loaders[0]
     # lr_finder.range_test(trainloader, end_lr=100, num_iter=100)
@@ -438,7 +504,9 @@ if __name__ == "__main__":
     # stop
 
 
-    print("Fold:",len(train_loaders))
+    # print("Fold:",len(train_loaders))
+    print("Fold:",FOLD)
+    
     for fold in range(0,len(train_loaders)):
         train_loader = train_loaders[fold]
         val_loader = val_loaders[fold]
@@ -449,8 +517,10 @@ if __name__ == "__main__":
         # print("Average std:", std)
 
         model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
+
         max_acc = 0
         min_loss = 10000
+        min_loss_ep = 0
         best_model_dict = None
         data_num = 0
         loss_avg = 0
@@ -461,21 +531,32 @@ if __name__ == "__main__":
 #       optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
 #       optimizer = torch.optim.SGD(model.parameters(),lr=lr)
         # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+        
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.95, weight_decay=1e-4)
+        # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99), weight_decay=1e-4)
         cycle_len = indices_len*(1-vr)*epochs/batch_size
-        onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=20, div=100, momentum_vals=(0.95, 0.8))
+        onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=15, div=50, momentum_vals=(0.95, 0.8))
         # lr_scheduler = OneCycleLR(optimizer, num_steps=20, lr_range=(1e-5,0.15))
 #             optimizer = torch.optim.RMSprop(model.parameters(),lr=lr)
-        # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
 #         optimizer = torch.optim.Adagrad(model.parameters(),lr=lr)
 #         optimizer = adabound.AdaBound(model.parameters(), lr=lr, final_lr=0.01,amsbound=True)
         # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
 #         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=period,T_mult=1,eta_min=1e-5) #original 
         # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
 
+
         if USE_AMP == True:
             model, optimizer = model, optimizer = amp.initialize(model, optimizer, opt_level="O2",
                                                                  keep_batchnorm_fp32=True, loss_scale="dynamic")
+
+        if USE_MULTI_GPU:
+            # from apex.parallel import DistributedDataParallel
+            # model = DistributedDataParallel(model)
+            os.system("nvidia-smi")
+            # gpus = [0,1,2,3]
+            # model = nn.DataParallel(model, device_ids=gpus, output_device=gpus[0])
+            model = nn.DataParallel(model)
+
 
         for ep in range(0,epochs+1):
             model.train()
@@ -492,7 +573,7 @@ if __name__ == "__main__":
                 
                 cutmix_tag = True if np.random.random()<CUT_MIX_RATE else False
                 if USE_CUTMIX == True and cutmix_tag == True:
-                    img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
+                    img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(LAMBDA,1))
                     ###Post Norm
                     # for j in range(img.size(0)):
                     #     tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
@@ -529,8 +610,8 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
 
                 if USE_AMP == True:
-                    if IMAGE_SIZE == (224,224) or MODEL_TYPE=="101":
-                        loss = loss * 0.5
+                    # if IMAGE_SIZE == (224,224) or MODEL_TYPE=="101":
+                    #     loss = loss * 0.5
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
                         scaled_loss.backward()
                 else:
@@ -579,37 +660,37 @@ if __name__ == "__main__":
                             _,pred_class_constant = torch.max(pred_constant.data, 1)
 
                             ###Origin metric
-                            # acc_root += (pred_class_root == target[:,0]).sum().item()
-                            # acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
-                            # acc_constant += (pred_class_constant == target[:,2]).sum().item()
-                            # data_num += img.size(0)
+                            acc_root += (pred_class_root == target[:,0]).sum().item()
+                            acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
+                            acc_constant += (pred_class_constant == target[:,2]).sum().item()
+                            data_num += img.size(0)
 
                             ###Contest metric
-                            r_preds.append(pred_class_root.cpu().numpy())
-                            v_preds.append(pred_class_vowel.cpu().numpy())
-                            c_preds.append(pred_class_constant.cpu().numpy())
-                            r_targets.append(target[:,0].cpu().numpy())
-                            v_targets.append(target[:,1].cpu().numpy())
-                            c_targets.append(target[:,2].cpu().numpy())
+                            # r_preds.append(pred_class_root.cpu().numpy())
+                            # v_preds.append(pred_class_vowel.cpu().numpy())
+                            # c_preds.append(pred_class_constant.cpu().numpy())
+                            # r_targets.append(target[:,0].cpu().numpy())
+                            # v_targets.append(target[:,1].cpu().numpy())
+                            # c_targets.append(target[:,2].cpu().numpy())
 
                     ###Origin metric
-                    # acc_root /= data_num
-                    # acc_vowel /= data_num
-                    # acc_constant /= data_num
-                    # val_loss_root /= data_num
-                    # val_loss_vowel /= data_num
-                    # val_loss_constant /= data_num
-                    # acc = (2*acc_root + acc_vowel + acc_constant)/4
-                    # val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
+                    acc_root /= data_num
+                    acc_vowel /= data_num
+                    acc_constant /= data_num
+                    val_loss_root /= data_num
+                    val_loss_vowel /= data_num
+                    val_loss_constant /= data_num
+                    acc = (2*acc_root + acc_vowel + acc_constant)/4
+                    val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
 
                     ####Contest metric
-                    r_preds = [tmp_j for tmp_i in r_preds for tmp_j in tmp_i]
-                    v_preds = [tmp_j for tmp_i in v_preds for tmp_j in tmp_i]
-                    c_preds = [tmp_j for tmp_i in c_preds for tmp_j in tmp_i]
-                    r_targets = [tmp_j for tmp_i in r_targets for tmp_j in tmp_i]
-                    v_targets = [tmp_j for tmp_i in v_targets for tmp_j in tmp_i]
-                    c_targets = [tmp_j for tmp_i in c_targets for tmp_j in tmp_i]
-                    acc = get_score([r_preds,v_preds,c_preds],[r_targets,v_targets,c_targets])
+                    # r_preds = [tmp_j for tmp_i in r_preds for tmp_j in tmp_i]
+                    # v_preds = [tmp_j for tmp_i in v_preds for tmp_j in tmp_i]
+                    # c_preds = [tmp_j for tmp_i in c_preds for tmp_j in tmp_i]
+                    # r_targets = [tmp_j for tmp_i in r_targets for tmp_j in tmp_i]
+                    # v_targets = [tmp_j for tmp_i in v_targets for tmp_j in tmp_i]
+                    # c_targets = [tmp_j for tmp_i in c_targets for tmp_j in tmp_i]
+                    # acc = get_score([r_preds,v_preds,c_preds],[r_targets,v_targets,c_targets])
                     # print("final score:",acc)
 
                     ###Plateau
@@ -620,26 +701,40 @@ if __name__ == "__main__":
                     # lr_scheduler.step()
 
                     ###Origin metric
-                    # print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
-                    #         .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
+                    print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
+                            .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
 
                     ###Contest metric
-                    print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,lr:{}"
-                            .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,optimizer.param_groups[0]['lr']))
+                    # print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,lr:{}"
+                    #         .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,optimizer.param_groups[0]['lr']))
 
                     if acc >= max_acc:
                         max_acc = acc
-                        min_loss = val_loss
-                        best_model_dict = model.state_dict()                    
-                        if max_acc>0.994:
-                            torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,fold,max_acc*1e2))
-                    torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,fold))
+                        # best_model_dict = model.state_dict()
+                        if USE_MULTI_GPU:
+                            best_model_dict = model.module.state_dict()  ###multi gpu
+                        else:
+                            best_model_dict = model.state_dict()         ###single gpu   
+                        if max_acc>0.996:
+                            torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,FOLD,max_acc*1e2))
                     
-    #                 if val_loss <= min_loss:
-    #                     max_acc = acc
-    #                     min_loss = val_loss
-    #                     best_model_dict = model.state_dict()
+                    # if val_loss <= min_loss:
+                    #     min_loss = val_loss
+                    #     min_loss_ep = ep
+                    #     if USE_MULTI_GPU:
+                    #         best_loss_model_dict = model.module.state_dict()  ###multi gpu
+                    #     else:
+                    #         best_loss_model_dict = model.state_dict()         ###single gpu                
+                    #     if max_acc>0.996:
+                    #         torch.save(best_loss_model_dict, "{}_Ep{}_Fold{}_loss{:.4f}".format(save_file_name,ep,FOLD,min_loss*1e3))
+                    if ep>=170:
+                        if USE_MULTI_GPU:
+                            current_model_dict = model.module.state_dict()  ###multi gpu
+                        else:
+                            current_model_dict = model.state_dict()         ###single gpu                
+                        torch.save(current_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}_loss{:.4f}".format(save_file_name,ep,FOLD,acc*1e2,val_loss*1e3))
 
+                    torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,FOLD))
                     ##Don't forget change model back to train()
                     model.train()
 
@@ -647,9 +742,11 @@ if __name__ == "__main__":
             #     break         
                 
         ###K-Fold ensemble: Saved k best model for k dataloader
-        print("===================Best Fold:{} Saved Loss:{} Acc:{}==================".format(fold,min_loss,max_acc))
-        torch.save(best_model_dict, "{}_Fold{}_loss{:.4f}_acc{:.3f}".format(save_file_name,fold,min_loss*1e3,max_acc*1e2))
-        print("======================================================")
+        print("===================Best Fold:{} Saved Acc:{}==================".format(FOLD,max_acc))
+        torch.save(best_model_dict, "{}_Fold{}_acc{:.3f}".format(save_file_name,FOLD,max_acc*1e2))
+        # print("===================Best Fold:{} Saved Loss:{}==================".format(FOLD,min_loss))
+        # torch.save(best_loss_model_dict, "{}_Fold{}_loss{:.4f}_EP:{}".format(save_file_name,FOLD,min_loss*1e3,min_loss_ep))
+        # print("======================================================")
 
         del model
         torch.cuda.empty_cache()
