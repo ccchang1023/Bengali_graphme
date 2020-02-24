@@ -48,7 +48,7 @@ DROP_RATE = None     ###If no dp, use None instead of 0
 USE_AMP = True
 USE_MISH = False
 
-FOLD = 6
+FOLD = 0
 
 
 import torch.nn as nn
@@ -114,8 +114,6 @@ def get_dataset_mean_std(dataloader):
     # print("Average mean:",mean)
     # print("Average std:", std)
     return mean.cpu().numpy(), std.cpu().numpy()
-
-
 
 
 def get_augmented_img(img, func):
@@ -477,14 +475,14 @@ if __name__ == "__main__":
     batch_size = 200
     val_period = 640
     train_period = 1
-    num_workers = 1
+    num_workers = 12
     k = 7
     indices_len = 232560
     vr = 1/k
 
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0224_mor_ensemble/ordered_ocp0.15_prcnt15_div50_EP180_b200_vp640_224x224_pre1_mor0.3Cutmix1_vr0.15_fp16_noLS_fold{}".format(FOLD)
+    save_file_name = "./B_saved_model_0224/ocp0.15_prcnt15_div50_EP180_b200_vp640_224x224_pre1_mor0.3Cutmix1_noLS_vr0.15_fp16_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -586,6 +584,7 @@ if __name__ == "__main__":
                 
                 img, target = data
                 img, target = img.to(device), target.to(device,dtype=torch.long)
+
 
                 tmp_rand = np.random.random()
                 cutmix_tag = True if tmp_rand<CUT_MIX_RATE else False
