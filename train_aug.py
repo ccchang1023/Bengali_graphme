@@ -29,19 +29,19 @@ train_labels = np.load("./0220_ordered_232560_labels.npy")
 # train_images = np.load("./128x128_by_lafoss_shuffled.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
-IMAGE_SIZE = (256,256)
+IMAGE_SIZE = (224,224)
 MODEL_TYPE = "50"
 USE_CUTMIX = True
 USE_MIXUP = False
-USE_CUTOUT = False
-MOR_AUG_RATE = 0
-CUT_MIX_RATE = 1
+USE_CUTOUT = True
+MOR_AUG_RATE = 0.3
+CUT_MIX_RATE = 0.8
 
 POST_AUG_RATE = 0
 
 USE_FOCAL_LOSS = False
 USE_CLASS_BALANCED_LOSS = False
-USE_LABEL_SMOOTHING = False
+USE_LABEL_SMOOTHING = True
 LS_EPSILON = 0.1
 
 NO_EXTRA_AUG = True
@@ -56,7 +56,7 @@ USE_MISH = False
 
 FINE_TUNE_EP = 10
 
-FOLD = 0
+FOLD = 1
 
 
 import torch.nn as nn
@@ -446,8 +446,8 @@ if __name__ == "__main__":
     epochs = 180
     ensemble_models = []
     lr = 1e-5
-    batch_size = 160
-    val_period = 800
+    batch_size = 200
+    val_period = 640
     train_period = 1
     num_workers = 12
     k = 7
@@ -458,7 +458,7 @@ if __name__ == "__main__":
     vr = 1/k
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0226/7fold_ocp0.15_prcnt15_div50_EP180_b160_vp800_256x256_pre1_Cutmix1_fp16_fineTune10_fold{}".format(FOLD)
+    save_file_name = "./B_saved_model_0226/7fold_ocp0.15_prcnt15_div50_EP180_Tune10_b200_vp640_224x224_pre1_way1Mor0.3Cutmix0.8Cutout0.2_LS_fp16_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
