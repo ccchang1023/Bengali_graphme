@@ -29,24 +29,32 @@ train_labels = np.load("./0220_ordered_232560_labels.npy")
 # train_images = np.load("./128x128_by_lafoss_shuffled.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
-IMAGE_SIZE = (224,224)
+IMAGE_SIZE = (256,256)
 MODEL_TYPE = "50"
 USE_CUTMIX = True
-
-MOR_AUG_RATE = 0.3
+USE_MIXUP = False
+USE_CUTOUT = False
+MOR_AUG_RATE = 0
 CUT_MIX_RATE = 1
+
 POST_AUG_RATE = 0
 
 USE_FOCAL_LOSS = False
 USE_CLASS_BALANCED_LOSS = False
 USE_LABEL_SMOOTHING = False
+LS_EPSILON = 0.1
 
 NO_EXTRA_AUG = True
+
 USE_PRETRAINED = True
 DROP_RATE = None     ###If no dp, use None instead of 0
 
 USE_AMP = True
+OPT_LEVEL = "O2"
+
 USE_MISH = False
+
+FINE_TUNE_EP = 10
 
 FOLD = 0
 
@@ -92,8 +100,6 @@ def get_resnext_model(model_type="101", pretrained=True, dropout=None):
     return model
 
 
-
-
 def get_dataset_mean_std(dataloader):
     print("Calculate distribution:")
     mean = 0.
@@ -115,13 +121,11 @@ def get_dataset_mean_std(dataloader):
     # print("Average std:", std)
     return mean.cpu().numpy(), std.cpu().numpy()
 
-
 def get_augmented_img(img, func):
     output_img = np.zeros((h * 2, w), dtype=np.uint8)
     output_img[:h] = img
     output_img[h:] = func(img)
     return output_img
-
 
 
 class FocalLossWithOutOneHot(nn.Module):
@@ -219,7 +223,7 @@ def cutmix_criterion(preds1,preds2,preds3, targets):
     elif USE_FOCAL_LOSS == True:
         criterion2 = FocalLossWithOutOneHot(gamma=2)
     elif USE_LABEL_SMOOTHING == True:
-        criterion2 = label_smoothing_criterion()        
+        criterion2 = label_smoothing_criterion(epsilon=LS_EPSILON)        
     else:
         criterion2 = nn.CrossEntropyLoss(reduction='mean')
 
@@ -230,6 +234,26 @@ def cutmix_criterion(preds1,preds2,preds3, targets):
     return lam * criterion2(preds1, targets1) + (1 - lam) * \
            criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * \
            criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
+
+
+def cutout(data, targets1, targets2, targets3, alpha):
+    lam = np.random.beta(alpha, alpha)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(data.size(), lam)
+    data[:, :, bbx1:bbx2, bby1:bby2] = 0
+    targets = [targets1, targets2, targets3]
+    return data, targets
+
+def cutout_criterion(preds1,preds2,preds3, targets):
+    targets1, targets2,targets3  = targets[0], targets[1], targets[2]
+    if USE_CLASS_BALANCED_LOSS == True:
+        criterion2 = get_cb_loss
+    elif USE_FOCAL_LOSS == True:
+        criterion2 = FocalLossWithOutOneHot(gamma=2)
+    elif USE_LABEL_SMOOTHING == True:
+        criterion2 = label_smoothing_criterion(epsilon=LS_EPSILON)        
+    else:
+        criterion2 = nn.CrossEntropyLoss(reduction='mean')
+    return criterion2(preds1, targets1) + criterion2(preds2, targets2) + criterion2(preds3, targets3)
 
 
 def mixup(data, targets1, targets2, targets3, alpha):
@@ -263,60 +287,6 @@ def get_score(preds,targets):
     final_score = np.average(scores, weights=[2,1,1])
     return final_score
 
-###Morphological Augmentation
-import cv2, random
-class Morphological_Aug(object):
-    """Convert a ``PIL Image`` or ``numpy.ndarray`` to tensor.
-    Converts a PIL Image or numpy.ndarray (H x W x C) in the range
-    [0, 255] to a torch.FloatTensor of shape (C x H x W) in the range [0.0, 1.0]
-    """
-    def __call__(self, pic):  ###Input image: (HxWxC)
-#         print("here",np.shape(pic),np.max(pic))
-#         print("here",random.random())
-        return Image.fromarray(func_hybrid(pic))
-
-    def __repr__(self):
-        return self.__class__.__name__ + '()'
-
-def trans_morphological(img):
-    return func_hybrid(img)
-
-def func_Erosion(img):
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
-    img = cv2.erode(np.float32(img), kernel, iterations=1)
-    return img
-
-def func_Dilation(img):
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
-    img = cv2.dilate(np.float32(img), kernel, iterations=1)
-    return img
-
-def get_random_kernel():
-    structure = np.random.choice([cv2.MORPH_RECT, cv2.MORPH_ELLIPSE, cv2.MORPH_CROSS])
-    kernel = cv2.getStructuringElement(structure, tuple(np.random.randint(1, 5, 2)))
-    return kernel
-
-def func_opening(img):
-    img = cv2.erode(np.float32(img), get_random_kernel(), iterations=1)
-    img = cv2.dilate(np.float32(img), get_random_kernel(), iterations=1)
-    return img
-
-def func_closing(img):
-    img = cv2.dilate(np.float32(img), get_random_kernel(), iterations=1)
-    img = cv2.erode(np.float32(img), get_random_kernel(), iterations=1)
-    return img
-
-def func_hybrid(img):
-    rand_tag = np.random.random()
-    if rand_tag < 0.25:
-        img = func_Erosion(img)
-    elif rand_tag < 0.5:
-        img = func_Dilation(img)
-    elif rand_tag < 0.75:
-        img = func_opening(img)
-    else:
-        img = func_closing(img)        
-    return img
 
 
 trans_none = transforms.Compose([
@@ -325,12 +295,6 @@ trans_none = transforms.Compose([
         # transforms.Normalize(mean=[0.05302268],std=[0.15688393]) #train_images 128x128 vr 0
         # transforms.Normalize(mean=[0.0530355],std=[0.15949783]) #train_images 224x224 vr 0
 ])
-
-trans_resize = transforms.Resize(IMAGE_SIZE)
-trans_mor = Morphological_Aug()
-trans_hflip = transforms.RandomHorizontalFlip(1)
-trans_vflip = transforms.RandomVerticalFlip(1)
-trans_toTensor = transforms.ToTensor()
 
 trans_post = transforms.Compose([
         ###post1
@@ -363,6 +327,49 @@ trans_val = transforms.Compose([
     ])
 
 
+###Morphological Augmentation
+def trans_morphological(img):
+    return func_hybrid(img)
+
+def func_Erosion(img):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
+    img = cv2.erode(img, kernel, iterations=1)
+    return img
+
+def func_Dilation(img):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, tuple(np.random.randint(1, 5, 2)))
+    img = cv2.dilate(img, kernel, iterations=1)
+    return img
+
+def get_random_kernel():
+    structure = np.random.choice([cv2.MORPH_RECT, cv2.MORPH_ELLIPSE, cv2.MORPH_CROSS])
+    kernel = cv2.getStructuringElement(structure, tuple(np.random.randint(1, 5, 2)))
+    return kernel
+
+def func_opening(img):
+    img = cv2.erode(img, get_random_kernel(), iterations=1)
+    img = cv2.dilate(img, get_random_kernel(), iterations=1)
+    return img
+
+def func_closing(img):
+    img = cv2.dilate(img, get_random_kernel(), iterations=1)
+    img = cv2.erode(img, get_random_kernel(), iterations=1)
+    return img
+
+def func_hybrid(img):
+    rand_tag = np.random.random()
+    if rand_tag < 0.25:
+        img = func_Erosion(img)
+    elif rand_tag < 0.5:
+        img = func_Dilation(img)
+    elif rand_tag < 0.75:
+        img = func_opening(img)
+    else:
+        img = func_closing(img)        
+    return img
+
+
+
 class BengaliDataset(Dataset):
     def __init__(self,data_len=None, is_validate=False,validate_rate=None,indices=None):
         self.is_validate = is_validate
@@ -383,31 +390,18 @@ class BengaliDataset(Dataset):
                 self.transform = trans_none
             else:
                 self.transform = trans
-        self.trans_resize = trans_resize
-        self.trans_mor = trans_mor
-        self.trans_hflip = trans_hflip
-        self.trans_vflip = trans_hflip
-        self.trans_tensor = trans_toTensor                
 
     def set_transform(self,tag):
         self.transform = trans if tag else trans_none
 
     def __getitem__(self, idx):
+        random.seed(np.random.randint(1000000))
         idx += self.offset
         idx = self.indices[idx]
         img = np.uint8(self.data[idx]) #(137,236), value: 0~255
         labels = self.label[idx] #(num,3) grapheme_root, vowel_diacritic, constant_diacritic
         img = Image.fromarray(img)
-        
-        # img = self.transform(img)     #value: 0~1, shape:(1,137,236)
-
-        img = self.trans_resize(img)
-
-        tmp_rand = np.random.random()
-        if self.is_validate==False and tmp_rand<MOR_AUG_RATE:
-            img = self.trans_mor(img)
-
-        img = self.trans_tensor(img)
+        img = self.transform(img)     #value: 0~1, shape:(1,137,236)
         label = torch.as_tensor(labels, dtype=torch.uint8)    #value: 0~9, shape(3)
         # aug_tag = False if np.random.random() < CUT_MIX_RATE else True
 
@@ -449,46 +443,29 @@ def get_model(model_type="50", pretrained=False):
     return model
 
 if __name__ == "__main__":
-    ###Test
-    # import matplotlib.pyplot as plt
-    # indices_len = 232560
-    # batch_size = 1
-    # num_workers = 1
-    # train_dataset = BengaliDataset(data_len=None,is_validate=False, validate_rate=0.2,indices=np.arange(indices_len))
-    # train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers,worker_init_fn=lambda x: np.random.seed())
-    # with torch.no_grad():
-    #     while True:
-    #         for idx, data in enumerate(train_loader):
-    #             if idx >0:
-    #                 break
-    #             img, img_id = data
-    #             tmp_img = img.cpu().numpy()
-    #             fig, axes = plt.subplots(1,1,figsize=(9,3))            
-    #             axes.imshow(tmp_img[0][0])
-    #         plt.pause(.1)
-    #         input("stop")
-    # stop     
-
     epochs = 180
     ensemble_models = []
     lr = 1e-5
-    batch_size = 200
-    val_period = 640
+    batch_size = 160
+    val_period = 800
     train_period = 1
     num_workers = 12
     k = 7
+    # indices_len = 200840
     indices_len = 232560
+    # vr = 0.15
+    # vr = 0.2
     vr = 1/k
-
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0224/ocp0.15_prcnt15_div50_EP180_b200_vp640_224x224_pre1_mor0.3Cutmix1_noLS_vr0.15_fp16_fold{}".format(FOLD)
+    save_file_name = "./B_saved_model_0226/7fold_ocp0.15_prcnt15_div50_EP180_b160_vp800_256x256_pre1_Cutmix1_fp16_fineTune10_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
         criterion = FocalLossWithOutOneHot(gamma=2)
     else:
         criterion = torch.nn.CrossEntropyLoss()
+
 
     ###LR Finder
     # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
@@ -553,6 +530,10 @@ if __name__ == "__main__":
         loss_root_avg = 0
         loss_vowel_avg = 0
         loss_constant_avg = 0
+
+        best_lr = 0
+        best_mom = 0
+
         cutmix_tag = True
 #       optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
 #       optimizer = torch.optim.SGD(model.parameters(),lr=lr)
@@ -570,26 +551,69 @@ if __name__ == "__main__":
         # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
 
         if USE_AMP == True:
-            model, optimizer = model, optimizer = amp.initialize(model, optimizer, opt_level="O2",
+            if OPT_LEVEL == "O2":
+                model, optimizer = amp.initialize(model, optimizer, opt_level="O2",
                                                                  keep_batchnorm_fp32=True, loss_scale="dynamic")
-        for ep in range(0,epochs+1):
+            elif OPT_LEVEL == "O1":
+                model, optimizer = amp.initialize(model, optimizer, opt_level="O1")
+            else:
+                print("Wrong opt level")
+
+        for ep in range(0,epochs+1+FINE_TUNE_EP):
             model.train()
             for idx, data in enumerate(train_loader):
                 ###Onecycle policy
-                lr, mom = onecycle.calc()
+                if ep <epochs:
+                    lr, mom = onecycle.calc()
+                ###Fine tune 
+                else:
+                    lr, mom = best_lr, best_mom
+
                 for g in optimizer.param_groups:
                     g['lr'] = lr
                 for g in optimizer.param_groups:
                     g['momentum'] = mom
-                
+
                 img, target = data
                 img, target = img.to(device), target.to(device,dtype=torch.long)
-
+                
+                tmp_rand = np.random.random()
+                if tmp_rand < MOR_AUG_RATE:
+                    ###Morphological aug
+                    for j in range(img.size(0)):
+                        tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
+                        tmp_img = trans_norm(tmp_img)     #(1,h,w)
+                        img[j] = tmp_img
 
                 tmp_rand = np.random.random()
                 cutmix_tag = True if tmp_rand<CUT_MIX_RATE else False
                 if USE_CUTMIX == True and cutmix_tag == True:
                     img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
+                elif USE_MIXUP:
+                    img, targets = mixup(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.6,1))
+                elif USE_CUTOUT:
+                    img, targets = cutout(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.6,1))
+
+                    ###Post Norm
+                    # for j in range(img.size(0)):
+                    #     tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
+                    #     # print("here1",np.shape(tmp_img))
+                    #     img[j] = tmp_img
+
+
+                ###Old way                        
+                # elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE:
+                #     ###Post aug
+                #     for j in range(img.size(0)):
+                #         tmp_img = trans_post(np.uint8(img[j][0].cpu().numpy()*255))
+                #         img[j] = tmp_img
+                # elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE + MOR_AUG_RATE:
+                #     ###Morphological aug
+                #     for j in range(img.size(0)):
+                #         tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
+                #         tmp_img = trans_norm(tmp_img)     #(1,h,w)
+                #         img[j] = tmp_img
+
 
                 # pred_root, pred_vowel, pred_constant = model.new_forward(img)
                 pred_root, pred_vowel, pred_constant = model(img)
@@ -597,7 +621,11 @@ if __name__ == "__main__":
                 ##Cutmix test
                 if USE_CUTMIX == True and cutmix_tag == True:
                     loss = cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
-                    # print(loss.item())                        
+                    # print(loss.item()) 
+                elif USE_MIXUP == True:
+                    loss = mixup_criterion(pred_root,pred_vowel,pred_constant,targets)
+                elif USE_CUTOUT == True:
+                    loss = cutout_criterion(pred_root,pred_vowel,pred_constant,targets)
                 else:
                     loss_root = criterion(pred_root,target[:,0])
                     loss_vowel = criterion(pred_vowel,target[:,1])
@@ -714,6 +742,8 @@ if __name__ == "__main__":
                         max_acc = acc
                         min_loss = val_loss
                         best_model_dict = model.state_dict()                    
+                        best_lr = optimizer.param_groups[0]['lr']
+                        best_mom = optimizer.param_groups[0]['momentum']
                         if max_acc>0.998:
                             torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,FOLD,max_acc*1e2))
                     torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,FOLD))
