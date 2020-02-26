@@ -11,20 +11,21 @@ import matplotlib.pyplot as plt
 import sklearn.metrics
 import random
 from datetime import datetime
+from tqdm import tqdm
 
 from torch_lr_finder import LRFinder
 from One_Cycle_Policy import OneCycle
-from class_balanced_loss import get_cb_loss
+# from class_balanced_loss import get_cb_loss
 from apex import amp
 import cv2
 
 device = "cuda"
 
-# train_images = np.load("./train_images_invert_0203.npy")
-# train_labels = np.load("./train_labels_shuffle_0202.npy")
+train_images = np.load("./train_images_invert_0204.npy")
+train_labels = np.load("./train_labels_shuffle_0204.npy")
 
-train_images = np.load("./0220_ordered_232560_imgs.npy")
-train_labels = np.load("./0220_ordered_232560_labels.npy")
+# train_images = np.load("./0220_ordered_232560_imgs.npy")
+# train_labels = np.load("./0220_ordered_232560_labels.npy")
 
 # train_images = np.load("./128x128_by_lafoss_shuffled.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
@@ -49,7 +50,7 @@ NO_EXTRA_AUG = True
 USE_PRETRAINED = True
 DROP_RATE = None     ###If no dp, use None instead of 0
 
-USE_AMP = True
+USE_AMP = False
 OPT_LEVEL = "O2"
 
 USE_MISH = False
@@ -246,35 +247,52 @@ def get_model(model_type="50", pretrained=False):
 
 
 
+
+
 from sklearn.metrics import mean_squared_error # the metric to test 
 from sklearn.linear_model import LinearRegression #import model
 from sklearn.preprocessing import OneHotEncoder
 
+enc_r = OneHotEncoder(sparse=False,categories=[np.arange(168)])
+enc_v = OneHotEncoder(sparse=False,categories=[np.arange(11)])
+enc_c = OneHotEncoder(sparse=False,categories=[np.arange(7)])
+
+def one_hot(target,class_num):
+    ###Input:(batch,)
+    ###output:(batch,class_num)
+    batch_num = len(target)
+    one_hot_array = np.zeros(shape=(batch_num,class_num))
+    # print(target)
+    for i in range(batch_num):
+        indice = target[i]-1  ###label start from 0 ?
+        one_hot_array[i][indice] = 1
+    return one_hot_array
+
 if __name__ == "__main__":
 
-    x = np.random.random((500,1000))
-    # x2 = np.random.random((5,5))
-    # x = np.hstack((x,x2))
+    # x = np.random.random((3,10))
+    # # x2 = np.random.random((5,5))
+    # # x = np.hstack((x,x2))
     # print(np.shape(x))
-    y = np.random.randint(5,size=(500,1000))
-    # print("x",x)
-    print("y",y)
+    # y = np.random.randint(5,size=(3,))
+    # print(y)
+    # one_y = one_hot(y,10)
+    # print(one_y)
+    # print("one hot:",y_onehot)
+    # print(np.shape(y_onehot))
 
-    enc = OneHotEncoder(sparse=False,categories="auto")
-    y_onehot = enc.fit_transform(y)
-    print("one hot:",y_onehot)
-    print(np.shape(y_onehot))
-
-    meta_model = LinearRegression()
-    meta_model.fit(x,y_onehot)
-    print("pred:",meta_model.predict(x))
-    stop
-
+    # ### fit(x,y)  x:(batch_num,feature_num) 2D,  y:(batch_num,feature,) or (batch_num,feature,one_hot_feature) 
+    # ### X needs to be 2D, y needs to be 1D(labels) or 2D(one hot label)
+    # meta_model = LinearRegression()
+    # meta_model.fit(x,y_onehot)
+    # # print("pred:",meta_model.predict(x))
+    # stop
 
     batch_size = 256
     num_workers = 12
     k = 7
-    indices_len = 232560
+    # indices_len = 232560
+    indices_len = 200840
     vr = 1/k
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
@@ -292,7 +310,7 @@ if __name__ == "__main__":
     for file_name in os.listdir(ensemble_root):
         print(file_name)
         model = get_model(model_type=MODEL_TYPE,pretrained=False)
-        if USE_APEX == True:
+        if USE_AMP == True:
             model = amp.initialize(model,None,opt_level="O2",keep_batchnorm_fp32=True,verbosity=0,loss_scale="dynamic")
         model.load_state_dict(torch.load("{}/{}".format(ensemble_root,file_name)))
         model.eval()
@@ -305,7 +323,6 @@ if __name__ == "__main__":
         train_loader = train_loaders[0]
         val_loader = val_loaders[0]
         model = ensemble_models[model_i]
-
         if USE_AMP == True:
             if OPT_LEVEL == "O2":
                 model, optimizer = amp.initialize(model, optimizer, opt_level="O2",
@@ -316,20 +333,65 @@ if __name__ == "__main__":
                 print("Wrong opt level")
 
     ###Train meta model
-    meta_model_r=LinearRegression()
-    meta_model_v=LinearRegression()
-    meta_model_c=LinearRegression()
-    
+    meta_model_r = LinearRegression()
+    meta_model_v = LinearRegression()
+    meta_model_c = LinearRegression()
+
+    stack_pred_r = np.empty([0,168*model_num])
+    stack_pred_v = np.empty([0,11*model_num])
+    stack_pred_c = np.empty([0,7*model_num])
+    stack_target_r = np.empty([0,168])
+    stack_target_v = np.empty([0,11])
+    stack_target_c = np.empty([0,7])
 
     with torch.no_grad():
-        for idx, data in enumerate(val_loader):
+        for idx, data in enumerate(tqdm(val_loader)):
             img, target = data
             img, target = img.to(device), target.to(device,dtype=torch.long)
-            pred_root, pred_vowel, pred_constant = model(img)  #(batch_num,167)
+
+            pred_list_root = torch.Tensor([]).to(device)
+            pred_list_vow = torch.Tensor([]).to(device)
+            pred_list_const = torch.Tensor([]).to(device)
+            for model_i in range(model_num):
+                pred_root, pred_vow, pred_const = ensemble_models[model_i](img) #(batch_num, label_num)
+                pred_list_root = torch.cat((pred_list_root,pred_root),dim=1)      #pred_list: (batch_num,168*model_num)
+                pred_list_vow = torch.cat((pred_list_vow,pred_vow),dim=1)         #pred_list: (batch_num,11*model_num)
+                pred_list_const = torch.cat((pred_list_const,pred_const),dim=1)   #pred_list: (batch_num,7*model_num) 
+
+            tmp_pr = pred_list_root.cpu().numpy()
+            tmp_pv = pred_list_vow.cpu().numpy()
+            tmp_pc = pred_list_const.cpu().numpy()
+            # print("here1",np.shape(tmp_pr))
+            # print("here2",np.shape(tmp_pv))
+            # print("here3",np.shape(tmp_pc))
+            
+            stack_pred_r = np.concatenate((stack_pred_r,tmp_pr),axis=0)      ###(total_num,168*model_num)
+            stack_pred_v = np.concatenate((stack_pred_v,tmp_pv),axis=0)     ###(total_num,11*model_num)
+            stack_pred_c = np.concatenate((stack_pred_c,tmp_pc),axis=0)  ###(total_num,7*model_num)
+
+            tmp_target = target.cpu().numpy()
+            tmp_tr, tmp_tv, tmp_tc = tmp_target[:,0],tmp_target[:,1],tmp_target[:,2]   ###(batch,class_num)
+
+            stack_target_r = np.concatenate((stack_target_r,one_hot(tmp_tr,168)),axis=0)   ###(total_num,168)
+            stack_target_v = np.concatenate((stack_target_v,one_hot(tmp_tv,11)),axis=0)   ###(total_num,11)
+            stack_target_c = np.concatenate((stack_target_c,one_hot(tmp_tc,7)),axis=0)   ###(total_num,7)
+
+        print("here4",np.shape(stack_pred_r))
+        print("here5",np.shape(stack_pred_v))
+        print("here6",np.shape(stack_pred_c))            
+        print("here7",np.shape(stack_target_r))
+        print("here8",np.shape(stack_target_v))
+        print("here9",np.shape(stack_target_c))            
+        stop
+
+    ### fit(x,y)  x:(batch_num,feature_num) 2D,  y:(batch_num,feature,) or (batch_num,feature,one_hot_feature) 
+    ### X needs to be 2D, y needs to be 1D(labels) or 2D(one hot label)
+    meta_model_r.fit(stack_pred_r,stack_target_r)
+    meta_model_v.fit(stack_pred_v,stack_target_v)
+    meta_model_c.fit(stack_pred_c,stack_target_c)
 
 
-    ###stacked_pred:(data_num, 167,5), ###targets:(data_num,167)
-    meta_model_r.fit(stacked_pred,targets)
+
 
     #     acc_root = 0
     #     acc_vowel = 0
