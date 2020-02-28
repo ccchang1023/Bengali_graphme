@@ -20,22 +20,18 @@ import cv2
 
 device = "cuda"
 
-# train_images = np.load("./train_images_invert_0203.npy")
-# train_labels = np.load("./train_labels_shuffle_0202.npy")
-
 train_images = np.load("./0220_ordered_232560_imgs.npy")
 train_labels = np.load("./0220_ordered_232560_labels.npy")
 
-# train_images = np.load("./128x128_by_lafoss_shuffled.npy")
-# train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
-
 IMAGE_SIZE = (224,224)
-MODEL_TYPE = "101"
+MODEL_TYPE = "50"
 USE_CUTMIX = True
 USE_MIXUP = False
 USE_CUTOUT = False
 MOR_AUG_RATE = 0.3
-CUT_MIX_RATE = 0.9
+CUT_MIX_RATE = 1
+
+DOUBLE_CUT_RATE = 0.6
 
 POST_AUG_RATE = 0
 
@@ -56,7 +52,7 @@ USE_MISH = False
 
 FINE_TUNE_EP = 10
 
-FOLD = 0
+FOLD = 3
 
 
 import torch.nn as nn
@@ -197,10 +193,10 @@ def rand_bbox(size, lam):
     bbx2 = np.clip(cx + cut_w // 2, 0, W)
     bby2 = np.clip(cy + cut_h // 2, 0, H)
     return bbx1, bby1, bbx2, bby2
-
+    
 def cutmix(data, targets1, targets2, targets3, alpha):
     indices = torch.randperm(data.size(0))
-    shuffled_data = data[indices]
+    # shuffled_data = data[indices]
     shuffled_targets1 = targets1[indices]
     shuffled_targets2 = targets2[indices]
     shuffled_targets3 = targets3[indices]
@@ -208,7 +204,6 @@ def cutmix(data, targets1, targets2, targets3, alpha):
     lam = np.random.beta(alpha, alpha)
     bbx1, bby1, bbx2, bby2 = rand_bbox(data.size(), lam)
     data[:, :, bbx1:bbx2, bby1:bby2] = data[indices, :, bbx1:bbx2, bby1:bby2]
-    # adjust lambda to exactly match pixel ratio
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (data.size()[-1] * data.size()[-2]))
 
     targets = [targets1, shuffled_targets1, targets2, shuffled_targets2, targets3, shuffled_targets3, lam]
@@ -226,14 +221,46 @@ def cutmix_criterion(preds1,preds2,preds3, targets):
         criterion2 = label_smoothing_criterion(epsilon=LS_EPSILON)        
     else:
         criterion2 = nn.CrossEntropyLoss(reduction='mean')
-
-    # tmp_loss = criterion2(preds3, targets5)
-    # print("here",tmp_loss)
-
-#     print("here", preds1.size(), np.shape(targets1))
     return lam * criterion2(preds1, targets1) + (1 - lam) * \
            criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * \
            criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
+
+def double_cutmix(data, tr, tv, tc, tr2, tv2, tc2, lam,alpha2):
+    indices = torch.randperm(data.size(0))
+    s_tr = tr[indices]
+    s_tv = tv[indices]
+    s_tc = tc[indices]
+
+    s_tr2 = tr2[indices]
+    s_tv2 = tv2[indices]
+    s_tc2 = tc2[indices]
+
+    lam2 = np.random.beta(alpha2, alpha2)
+    bbx1, bby1, bbx2, bby2 = rand_bbox(data.size(), lam2)
+    data[:, :, bbx1:bbx2, bby1:bby2] = data[indices, :, bbx1:bbx2, bby1:bby2]
+    lam2 = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (data.size()[-1] * data.size()[-2]))
+    targets = [tr,tr2,s_tr,s_tr2,tv,tv2,s_tv,s_tv2,tc,tc2,s_tc,s_tc2,lam,lam2]
+    return data, targets
+
+def double_cutmix_criterion(preds1,preds2,preds3,tar):
+    tr,tr2,s_tr,s_tr2,tv,tv2,s_tv,s_tv2,tc,tc2,s_tc,s_tc2,lam,lam2 = \
+    tar[0],tar[1],tar[2],tar[3],tar[4],tar[5],tar[6],tar[7],tar[8],tar[9],tar[10],tar[11],tar[12],tar[13]
+
+    if USE_CLASS_BALANCED_LOSS == True:
+        criterion2 = get_cb_loss
+    elif USE_FOCAL_LOSS == True:
+        criterion2 = FocalLossWithOutOneHot(gamma=2)
+    elif USE_LABEL_SMOOTHING == True:
+        criterion2 = label_smoothing_criterion(epsilon=LS_EPSILON)        
+    else:
+        criterion2 = nn.CrossEntropyLoss(reduction='mean')
+
+    return  lam2*lam*criterion2(preds1,tr)+lam2*(1-lam)*criterion2(preds1,s_tr)+\
+            (1-lam2)*lam*criterion2(preds1,tr2)+(1-lam2)*(1-lam)*criterion2(preds1,s_tr2)+\
+            lam2*lam*criterion2(preds2,tv)+lam2*(1-lam)*criterion2(preds2,s_tv)+\
+            (1-lam2)*lam*criterion2(preds2,tv2)+(1-lam2)*(1-lam)*criterion2(preds2,s_tv2)+\
+            lam2*lam*criterion2(preds3,tc)+lam2*(1-lam)*criterion2(preds3,s_tc)+\
+            (1-lam2)*lam*criterion2(preds3,tc2)+(1-lam2)*(1-lam)*criterion2(preds3,s_tc2)
 
 
 def cutout(data, targets1, targets2, targets3, alpha):
@@ -255,25 +282,6 @@ def cutout_criterion(preds1,preds2,preds3, targets):
         criterion2 = nn.CrossEntropyLoss(reduction='mean')
     return criterion2(preds1, targets1) + criterion2(preds2, targets2) + criterion2(preds3, targets3)
 
-
-def mixup(data, targets1, targets2, targets3, alpha):
-    indices = torch.randperm(data.size(0))
-    shuffled_data = data[indices]
-    shuffled_targets1 = targets1[indices]
-    shuffled_targets2 = targets2[indices]
-    shuffled_targets3 = targets3[indices]
-
-    lam = np.random.beta(alpha, alpha)
-    data = data * lam + shuffled_data * (1 - lam)
-    targets = [targets1, shuffled_targets1, targets2, shuffled_targets2, targets3, shuffled_targets3, lam]
-
-    return data, targets
-
-
-def mixup_criterion(preds1,preds2,preds3, targets):
-    targets1, targets2,targets3, targets4,targets5, targets6, lam = targets[0], targets[1], targets[2], targets[3], targets[4], targets[5], targets[6]
-    criterion2 = nn.CrossEntropyLoss(reduction='mean')
-    return lam * criterion2(preds1, targets1) + (1 - lam) * criterion2(preds1, targets2) + lam * criterion2(preds2, targets3) + (1 - lam) * criterion2(preds2, targets4) + lam * criterion2(preds3, targets5) + (1 - lam) * criterion2(preds3, targets6)
 
 
 def get_score(preds,targets):
@@ -446,20 +454,16 @@ if __name__ == "__main__":
     epochs = 180
     ensemble_models = []
     lr = 1e-5
-    batch_size = 128
-    val_period = 750        #5folds, batch128
-    # val_period = 550        #7folds, batch200
+    batch_size = 200
+    val_period = 640
     train_period = 1
     num_workers = 12
-    k = 5
-    # indices_len = 200840
+    k = 7
     indices_len = 232560
-    # vr = 0.15
-    # vr = 0.2
     vr = 1/k
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0228_dCut/5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold{}".format(FOLD)
+    save_file_name = "./B_saved_model_0228_dCut/7fold_ocp0.15_prcnt15_div50_EP180_Tune10_b200_vp640_224x224_pre1_mor0.3Cutmix1Double0.6_LS_fp16_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -467,60 +471,11 @@ if __name__ == "__main__":
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
-
-    ###LR Finder
-    # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.90)
-    # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
-    # trainloader = train_loaders[0]
-    # lr_finder.range_test(trainloader, end_lr=100, num_iter=100)
-    # lr_finder.plot() # to inspect the loss-learning rate graph
-    # lr_finder.reset() # to reset the model and optimizer to their initial state
-    # print("Done!")
-    # stop
-
-    ###LR Finder Leslie Smith's approach
-    # model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
-    # optimizer = torch.optim.SGD(model.parameters(), lr=1e-1, momentum=0.9, weight_decay=1e-2)
-    # trainloader = train_loaders[0]
-    # val_loader = val_loaders[0]
-    # lr_finder = LRFinder(model, optimizer, criterion, device="cuda")
-    # lr_finder.range_test(trainloader, val_loader=val_loader, end_lr=1, num_iter=100, step_mode="linear")
-    # lr_finder.plot(log_lr=False)
-    # lr_finder.reset()
-    # print("Done")
-    # stop
-
-    ###Check one cycle policy
-    # epoch = 100
-    # bs = 32 
-    # ### prcnt -> percentage of last steps, div-> max_lr/div = min_lr
-    # onecycle = OneCycle.OneCycle(indices_len*epoch /bs, 0.15, prcnt=10, div=1000, momentum_vals=(0.95, 0.8))
-    # lr_list = []
-    # for e in range(epoch):
-    #     for iterate in range(indices_len//bs):
-    #         lr, mom = onecycle.calc()
-    #         lr_list.append(lr)
-    # # print(np.array(lr_list))
-    # plt.xkcd()
-    # plt.xlabel("Iterations")
-    # plt.ylabel("Learning Rate")
-    # plt.xticks(np.arange(0, len(lr_list), step=100000), rotation=0)
-    # plt.plot(lr_list)
-    # plt.show()
-    # stop
-
-    # print("Fold:",len(train_loaders))
     print("Fold:",FOLD)
 
     for fold in range(0,len(train_loaders)):
         train_loader = train_loaders[fold]
         val_loader = val_loaders[fold]
-
-        ###Calculate mean and std
-        # mean, std = get_dataset_mean_std(train_loader)
-        # print("Average mean:",mean)
-        # print("Average std:", std)
 
         model = get_model(model_type=MODEL_TYPE,pretrained=USE_PRETRAINED)
         max_acc = 0
@@ -536,20 +491,9 @@ if __name__ == "__main__":
         best_mom = 0
 
         cutmix_tag = True
-#       optimizer = torch.optim.Adamax(model.parameters(),lr=0.002,weight_decay=0)
-#       optimizer = torch.optim.SGD(model.parameters(),lr=lr)
-        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
         optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.95, weight_decay=1e-4)
         cycle_len = indices_len*(1-vr)*epochs/batch_size
         onecycle = OneCycle.OneCycle(cycle_len, 0.15, prcnt=15, div=50, momentum_vals=(0.95, 0.8))
-        # lr_scheduler = OneCycleLR(optimizer, num_steps=20, lr_range=(1e-5,0.15))
-#             optimizer = torch.optim.RMSprop(model.parameters(),lr=lr)
-        # optimizer = torch.optim.Adam(model.parameters(),lr=lr,betas=(0.9,0.99))
-#         optimizer = torch.optim.Adagrad(model.parameters(),lr=lr)
-#         optimizer = adabound.AdaBound(model.parameters(), lr=lr, final_lr=0.01,amsbound=True)
-        # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-#         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer,T_0=period,T_mult=1,eta_min=1e-5) #original 
-        # lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, verbose=True, patience=30,factor=0.1)
 
         if USE_AMP == True:
             if OPT_LEVEL == "O2":
@@ -569,7 +513,6 @@ if __name__ == "__main__":
                 ###Fine tune 
                 else:
                     lr, mom = best_lr, best_mom
-                    lr = lr*0.98**(ep-epochs)
 
                 for g in optimizer.param_groups:
                     g['lr'] = lr
@@ -587,8 +530,9 @@ if __name__ == "__main__":
                         tmp_img = trans_norm(tmp_img)     #(1,h,w)
                         img[j] = tmp_img
 
+                ###Cutmix
                 tmp_rand = np.random.random()
-                cutmix_tag = True if tmp_rand<CUT_MIX_RATE else False
+                cutmix_tag = True if cutmix_tag and tmp_rand<CUT_MIX_RATE else False
                 if USE_CUTMIX == True and cutmix_tag == True:
                     img, targets = cutmix(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.8,1))
                 elif USE_MIXUP:
@@ -596,34 +540,18 @@ if __name__ == "__main__":
                 elif USE_CUTOUT:
                     img, targets = cutout(img, target[:,0],target[:,1],target[:,2],alpha=np.random.uniform(0.6,1))
 
-                    ###Post Norm
-                    # for j in range(img.size(0)):
-                    #     tmp_img = trans_norm(np.uint8(img[j][0].cpu().numpy()*255))
-                    #     # print("here1",np.shape(tmp_img))
-                    #     img[j] = tmp_img
-
-
-                ###Old way                        
-                # elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE:
-                #     ###Post aug
-                #     for j in range(img.size(0)):
-                #         tmp_img = trans_post(np.uint8(img[j][0].cpu().numpy()*255))
-                #         img[j] = tmp_img
-                # elif tmp_rand < CUT_MIX_RATE + POST_AUG_RATE + MOR_AUG_RATE:
-                #     ###Morphological aug
-                #     for j in range(img.size(0)):
-                #         tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
-                #         tmp_img = trans_norm(tmp_img)     #(1,h,w)
-                #         img[j] = tmp_img
-
-
-                # pred_root, pred_vowel, pred_constant = model.new_forward(img)
+                ###Double Cutmix
+                tmp_rand = np.random.random()
+                double_cutmix_tag = True if tmp_rand<DOUBLE_CUT_RATE else False
+                if double_cutmix_tag:
+                    tr,tr2,tv,tv2,tc,tc2,lam = targets[0],targets[1],targets[2],targets[3],targets[4],targets[5],targets[6]                    
+                    img, targets = double_cutmix(img, tr, tv, tc, tr2, tv2, tc2, lam,alpha2=np.random.uniform(0.8,1))
                 pred_root, pred_vowel, pred_constant = model(img)
-                
-                ##Cutmix test
-                if USE_CUTMIX == True and cutmix_tag == True:
+
+                if double_cutmix_tag:
+                    loss = double_cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
+                elif USE_CUTMIX == True and cutmix_tag == True:
                     loss = cutmix_criterion(pred_root,pred_vowel,pred_constant,targets)
-                    # print(loss.item()) 
                 elif USE_MIXUP == True:
                     loss = mixup_criterion(pred_root,pred_vowel,pred_constant,targets)
                 elif USE_CUTOUT == True:
@@ -637,9 +565,9 @@ if __name__ == "__main__":
                     loss_vowel_avg += loss_vowel.item()
                     loss_constant_avg += loss_constant.item()
                     loss_avg += loss.item()
-
-
+                
                 # print(loss.item())
+
                 data_num += img.size(0)
                 optimizer.zero_grad()
 
@@ -651,10 +579,11 @@ if __name__ == "__main__":
 
                 optimizer.step()
 
-                ###Validate periodically or at the end of every episode
-                if idx!=0 and (idx%val_period == 0 or img.size(0)!=batch_size):
-                    # print(idx)
-                    # continue
+                ###Cosine annealing
+    #             lr_scheduler.step()                    
+
+                ###Validation
+                if idx!=0 and idx%val_period == 0:
                     model.eval()
                     acc_root = 0
                     acc_vowel = 0
@@ -745,15 +674,10 @@ if __name__ == "__main__":
                         best_model_dict = model.state_dict()                    
                         best_lr = optimizer.param_groups[0]['lr']
                         best_mom = optimizer.param_groups[0]['momentum']
-                        if max_acc>0.9975:
+                        if max_acc>0.998:
                             torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,FOLD,max_acc*1e2))
                     torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,FOLD))
                     
-    #                 if val_loss <= min_loss:
-    #                     max_acc = acc
-    #                     min_loss = val_loss
-    #                     best_model_dict = model.state_dict()
-
                     ##Don't forget change model back to train()
                     model.train()
 
