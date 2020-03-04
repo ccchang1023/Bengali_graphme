@@ -34,7 +34,7 @@ MODEL_TYPE = "101"
 USE_CUTMIX = True
 USE_MIXUP = False
 USE_CUTOUT = False
-MOR_AUG_RATE = 0.3
+MOR_AUG_RATE = 0
 CUT_MIX_RATE = 0.9
 
 POST_AUG_RATE = 0
@@ -56,7 +56,7 @@ USE_MISH = False
 
 FINE_TUNE_EP = 10
 
-FOLD = 0
+FOLD = 4
 
 
 import torch.nn as nn
@@ -279,14 +279,13 @@ def mixup_criterion(preds1,preds2,preds3, targets):
 def get_score(preds,targets):
     scores = []
     for i in range(3):
-        # print("t shape:",np.shape(targets[i]))
-        # print("p shape:",np.shape(preds[i]))
+        # print("t shape:",np.shape(targets[i]))  #(total_val_num,), 1d array
+        # print("p shape:",np.shape(preds[i]))    #(total_val_num,)
         # print(targets)
         # print(preds)
         scores.append(sklearn.metrics.recall_score(targets[i],preds[i], average='macro'))
     final_score = np.average(scores, weights=[2,1,1])
     return final_score
-
 
 
 trans_none = transforms.Compose([
@@ -448,6 +447,7 @@ if __name__ == "__main__":
     lr = 1e-5
     batch_size = 128
     val_period = 750        #5folds, batch128
+    # val_period = 1500        #5folds, batch64
     # val_period = 550        #7folds, batch200
     train_period = 1
     num_workers = 12
@@ -459,7 +459,7 @@ if __name__ == "__main__":
     vr = 1/k
     print("validation rate:",vr)
     train_loaders, val_loaders = get_kfold_dataset_loader(k, vr, indices_len, batch_size, num_workers)
-    save_file_name = "./B_saved_model_0228_dCut/5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold{}".format(FOLD)
+    save_file_name = "./B_saved_model_0302_dCut/5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_Cutmix0.9_LS_fp16_recall_fold{}".format(FOLD)
     print(save_file_name)
 
     if USE_FOCAL_LOSS == True:
@@ -562,6 +562,7 @@ if __name__ == "__main__":
 
         for ep in range(0,epochs+1+FINE_TUNE_EP):
             model.train()
+            data_num = 0
             for idx, data in enumerate(train_loader):
                 ###Onecycle policy
                 if ep <epochs:
@@ -579,13 +580,13 @@ if __name__ == "__main__":
                 img, target = data
                 img, target = img.to(device), target.to(device,dtype=torch.long)
                 
-                tmp_rand = np.random.random()
-                if tmp_rand < MOR_AUG_RATE:
-                    ###Morphological aug
-                    for j in range(img.size(0)):
-                        tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
-                        tmp_img = trans_norm(tmp_img)     #(1,h,w)
-                        img[j] = tmp_img
+                ###Morphological aug
+                # tmp_rand = np.random.random()
+                # if tmp_rand < MOR_AUG_RATE:
+                #     for j in range(img.size(0)):
+                #         tmp_img = trans_morphological(np.uint8(img[j][0].cpu().numpy()*255))
+                #         tmp_img = trans_norm(tmp_img)     #(1,h,w)
+                #         img[j] = tmp_img
 
                 tmp_rand = np.random.random()
                 cutmix_tag = True if tmp_rand<CUT_MIX_RATE else False
@@ -652,7 +653,7 @@ if __name__ == "__main__":
                 optimizer.step()
 
                 ###Validate periodically or at the end of every episode
-                if idx!=0 and (idx%val_period == 0 or img.size(0)!=batch_size):
+                if idx!=0 and (idx%val_period == 0 or idx==len(train_loader)-1):
                     # print(idx)
                     # continue
                     model.eval()
@@ -691,37 +692,38 @@ if __name__ == "__main__":
                             _,pred_class_constant = torch.max(pred_constant.data, 1)
 
                             ###Origin metric
-                            acc_root += (pred_class_root == target[:,0]).sum().item()
-                            acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
-                            acc_constant += (pred_class_constant == target[:,2]).sum().item()
+                            # acc_root += (pred_class_root == target[:,0]).sum().item()
+                            # acc_vowel += (pred_class_vowel == target[:,1]).sum().item()
+                            # acc_constant += (pred_class_constant == target[:,2]).sum().item()
                             data_num += img.size(0)
 
                             ###Contest metric
-                            # r_preds.append(pred_class_root.cpu().numpy())
-                            # v_preds.append(pred_class_vowel.cpu().numpy())
-                            # c_preds.append(pred_class_constant.cpu().numpy())
-                            # r_targets.append(target[:,0].cpu().numpy())
-                            # v_targets.append(target[:,1].cpu().numpy())
-                            # c_targets.append(target[:,2].cpu().numpy())
+                            r_preds.append(pred_class_root.cpu().numpy())    #([[batch],[batch],[batch]....), simple append faster than concate
+                            v_preds.append(pred_class_vowel.cpu().numpy())  
+                            c_preds.append(pred_class_constant.cpu().numpy())
+                            r_targets.append(target[:,0].cpu().numpy())
+                            v_targets.append(target[:,1].cpu().numpy())
+                            c_targets.append(target[:,2].cpu().numpy())
 
                     ###Origin metric
-                    acc_root /= data_num
-                    acc_vowel /= data_num
-                    acc_constant /= data_num
+                    # acc_root /= data_num
+                    # acc_vowel /= data_num
+                    # acc_constant /= data_num
                     val_loss_root /= data_num
                     val_loss_vowel /= data_num
                     val_loss_constant /= data_num
-                    acc = (2*acc_root + acc_vowel + acc_constant)/4
+                    # acc = (2*acc_root + acc_vowel + acc_constant)/4
                     val_loss = (2*val_loss_root + val_loss_vowel + val_loss_constant)/4
 
+
                     ####Contest metric
-                    # r_preds = [tmp_j for tmp_i in r_preds for tmp_j in tmp_i]
-                    # v_preds = [tmp_j for tmp_i in v_preds for tmp_j in tmp_i]
-                    # c_preds = [tmp_j for tmp_i in c_preds for tmp_j in tmp_i]
-                    # r_targets = [tmp_j for tmp_i in r_targets for tmp_j in tmp_i]
-                    # v_targets = [tmp_j for tmp_i in v_targets for tmp_j in tmp_i]
-                    # c_targets = [tmp_j for tmp_i in c_targets for tmp_j in tmp_i]
-                    # acc = get_score([r_preds,v_preds,c_preds],[r_targets,v_targets,c_targets])
+                    r_preds = [tmp_j for tmp_i in r_preds for tmp_j in tmp_i]       #(total_val_number,)
+                    v_preds = [tmp_j for tmp_i in v_preds for tmp_j in tmp_i]
+                    c_preds = [tmp_j for tmp_i in c_preds for tmp_j in tmp_i]
+                    r_targets = [tmp_j for tmp_i in r_targets for tmp_j in tmp_i]
+                    v_targets = [tmp_j for tmp_i in v_targets for tmp_j in tmp_i]
+                    c_targets = [tmp_j for tmp_i in c_targets for tmp_j in tmp_i]
+                    acc = get_score([r_preds,v_preds,c_preds],[r_targets,v_targets,c_targets])
                     # print("final score:",acc)
 
                     ###Plateau
@@ -732,12 +734,12 @@ if __name__ == "__main__":
                     # lr_scheduler.step()
 
                     ###Origin metric
-                    print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
-                            .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
+                    # print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,ra:{:.4f}%,va:{:.4f}%,ca:{:.4f}%,lr:{}"
+                    #         .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,acc_root*100,acc_vowel*100,acc_constant*100,optimizer.param_groups[0]['lr']))
 
                     ###Contest metric
-                    # print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,lr:{}"
-                    #         .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,optimizer.param_groups[0]['lr']))
+                    print("Val Ep{},Loss:{:.6f},rl{:.4f},vl{:.4f},cl{:.4f},Acc:{:.4f}%,lr:{}"
+                            .format(ep,val_loss,val_loss_root,val_loss_vowel,val_loss_constant,acc*100,optimizer.param_groups[0]['lr']))
 
                     if acc >= max_acc:
                         max_acc = acc
@@ -745,7 +747,7 @@ if __name__ == "__main__":
                         best_model_dict = model.state_dict()                    
                         best_lr = optimizer.param_groups[0]['lr']
                         best_mom = optimizer.param_groups[0]['momentum']
-                        if max_acc>0.9975:
+                        if max_acc>0.998:
                             torch.save(best_model_dict, "{}_Ep{}_Fold{}_acc{:.4f}".format(save_file_name,ep,FOLD,max_acc*1e2))
                     torch.save(best_model_dict, "{}_Fold{}_current".format(save_file_name,FOLD))
                     

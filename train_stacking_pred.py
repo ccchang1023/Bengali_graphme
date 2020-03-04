@@ -31,7 +31,7 @@ train_labels = np.load("./0220_ordered_232560_labels.npy")
 # train_labels = np.load("./128x128_by_lafoss_shuffled_label.npy")
 
 IMAGE_SIZE = (224,224)
-MODEL_TYPE = "50"
+MODEL_TYPE = "101"
 USE_CUTMIX = True
 USE_MIXUP = False
 USE_CUTOUT = False
@@ -54,10 +54,10 @@ USE_AMP = False
 OPT_LEVEL = "O2"
 
 USE_MISH = False
-
 FINE_TUNE_EP = 10
 
-FOLD = 0
+FOLD = 4
+stack_model_name = "101_ep180_4fold_val4_0213"
 
 
 import torch.nn as nn
@@ -268,19 +268,19 @@ def one_hot(target,class_num):
 
 def save_stack_model(mr,mv,mc):
     # now you can save it to a file
-    joblib.dump(mr, 'stack_model_r.pkl') 
-    joblib.dump(mv, 'stack_model_v.pkl') 
-    joblib.dump(mc, 'stack_model_c.pkl') 
+    joblib.dump(mr, 'stack_model_r_{}.pkl'.format(stack_model_name))
+    joblib.dump(mv, 'stack_model_v_{}.pkl'.format(stack_model_name))
+    joblib.dump(mc, 'stack_model_c_{}.pkl'.format(stack_model_name))
     print("Save stacked model complete")
     return
 
 def load_stack_model():
     # and later you can load it
-    mr = joblib.load('stack_model_r.pkl')
-    mv = joblib.load('stack_model_v.pkl')
-    mc = joblib.load('stack_model_c.pkl')
+    mr = joblib.load('stack_model_r_{}.pkl'.format(stack_model_name))
+    mv = joblib.load('stack_model_v_{}.pkl'.format(stack_model_name))
+    mc = joblib.load('stack_model_c_{}.pkl'.format(stack_model_name))
+    print("load stacked model complete")
     return mr,mv,mc
-
 
 if __name__ == "__main__":
     # x = np.random.random((3,10))
@@ -299,9 +299,25 @@ if __name__ == "__main__":
     # stop
 
     ###Train meta model
+    # model_name = []
+    # ###Stacking model 0302
+    # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold4_Ep159_Fold4_acc99.8506")
+    # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold3_Ep143_Fold3_acc99.8452")
+    # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold2_Ep145_Fold2_acc99.8603")    
+    # # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold1_Ep155_Fold1_acc99.8495")
+    # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold0_Ep146_Fold0_acc99.8608")
+
+
+    # ###Stacking model 0304
+    # model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold0_Ep176_Fold0_acc99.8855")
+    # model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold2_Ep169_Fold2_acc99.8667")
+    # model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold1_Ep176_Fold1_acc99.8812")
+    # model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold3_Ep173_Fold3_acc99.8667")
+    
+
     # batch_size = 256
     # num_workers = 12
-    # k = 7
+    # k = 5
     # indices_len = 232560
     # # indices_len = 200840
     # vr = 1/k
@@ -313,14 +329,15 @@ if __name__ == "__main__":
     #     criterion = torch.nn.CrossEntropyLoss()
 
     # print("Fold:",FOLD)
-    # ensemble_root = "./stacking_model/"
+    # ensemble_root = "./stacking_model_0304/"
     # ensemble_models = []
     # data_num = 0
     # acc = 0 
 
-    # for file_name in os.listdir(ensemble_root):
+    # for file_name in model_name:
     #     if file_name.find("ocp") == -1:
     #         continue
+    
     #     print(file_name)
     #     model = get_model(model_type=MODEL_TYPE,pretrained=False)
     #     if USE_AMP == True:
@@ -358,7 +375,7 @@ if __name__ == "__main__":
     # stack_target_c = np.empty([0,7])
 
     # with torch.no_grad():
-    #     for idx, data in enumerate(tqdm(train_loader)):
+    #     for idx, data in enumerate(tqdm(val_loader)):
     #         img, target = data
     #         img, target = img.to(device), target.to(device,dtype=torch.long)
 
@@ -412,9 +429,24 @@ if __name__ == "__main__":
 
 
     ###Inference with meta model:
+    model_name = []
+    ###Stacking model 0302
+    # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold4_Ep159_Fold4_acc99.8506")
+    # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold3_Ep143_Fold3_acc99.8452")
+    # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold2_Ep145_Fold2_acc99.8603")    
+    # # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold1_Ep155_Fold1_acc99.8495")
+    # model_name.append("5fold_se101_ocp0.15_prcnt25_div70_EP150_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold0_Ep146_Fold0_acc99.8608")
+
+    ###Stacking model 0304
+    model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold0_Ep176_Fold0_acc99.8855")
+    model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold2_Ep169_Fold2_acc99.8667")
+    model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold1_Ep176_Fold1_acc99.8812")
+    model_name.append("5fold_se101_ocp0.15_prcnt15_div50_EP180_Tune10_b128_vp750_224x224_pre1_way1Mor0.3Cutmix0.9_LS_fp16_fold3_Ep173_Fold3_acc99.8667")
+    # model_name.append("")
+    
     batch_size = 256
     num_workers = 12
-    k = 7
+    k = 5
     indices_len = 232560
     vr = 1/k
     print("validation rate:",vr)
@@ -425,12 +457,12 @@ if __name__ == "__main__":
         criterion = torch.nn.CrossEntropyLoss()
 
     print("Fold:",FOLD)
-    ensemble_root = "./stacking_model/"
+    ensemble_root = "./stacking_model_0304/"
     ensemble_models = []
     data_num = 0
     acc = 0 
 
-    for file_name in os.listdir(ensemble_root):
+    for file_name in model_name:
         if file_name.find("ocp") == -1:
             continue
         print(file_name)
@@ -442,7 +474,7 @@ if __name__ == "__main__":
         ensemble_models.append(model)
 
     model_num = len(ensemble_models)
-    print("len of models:",model_num)    
+    print("len of models:",model_num)
 
     for model_i in range(len(ensemble_models)):
         train_loader = train_loaders[0]
@@ -472,7 +504,7 @@ if __name__ == "__main__":
     data_num = 0
 
     with torch.no_grad():
-        for idx, data in enumerate(tqdm(val_loader)):
+        for idx, data in enumerate(tqdm(train_loader)):
             img, target = data
             img, target = img.to(device), target.to(device,dtype=torch.long)
             pred_list_root = torch.Tensor([]).to(device)
